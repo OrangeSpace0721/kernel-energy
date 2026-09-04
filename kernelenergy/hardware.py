@@ -183,6 +183,43 @@ GPUS: dict[str, GPU] = {
         idle_power_w=32.0,
         nvml_patterns=(r"L40S",),
     ),
+    "L40": GPU(
+        # The L40S's quieter sibling: same AD102 die, same 142 SMs, near-identical
+        # clocks -- and a 300 W board instead of 350 W, with NVIDIA quoting its tensor
+        # throughput at FP32 accumulate (362 TFLOP/s) where the L40S is quoted at FP16
+        # accumulate (733). The descriptor difference is therefore almost entirely
+        # *power*, which makes the pair unusually informative for an energy model:
+        # two cards at the same point in SM/clock space with different budgets is a
+        # near-controlled experiment on what TDP alone does to achieved efficiency.
+        # Note this does not answer the L40S extrapolation problem in
+        # machine-descriptor-pipeweave.md §3 -- it duplicates the L40S's position
+        # rather than bracketing it -- but it does make that position no longer a
+        # single point.
+        gpu_key="L40",
+        name="NVIDIA L40",
+        architecture="Ada",
+        compute_capability=8.9,
+        sms=142,
+        ops_per_clk=1024,
+        ops_per_clk_fp32acc=512,
+        ops_per_clk_precision="bf16",
+        fma_per_clk=128,
+        xu_per_clk=16,
+        boost_clock_mhz=2490.0,
+        tensor_clock_mhz=2490.0,
+        max_sm_clock_mhz=2490.0,
+        mem_bandwidth_gbs=864.0,
+        l2_bandwidth_gbs=2430.0,
+        l2_cache_mb=96.0,
+        smem_bandwidth_b_per_clk_sm=128,
+        smem_size_kb_sm=100.0,
+        regfile_kb_sm=256.0,
+        mem_tech="GDDR",
+        tdp_w=300.0,
+        idle_power_w=30.0,
+        # Must not swallow "NVIDIA L40S" -- the negative lookahead is the whole point.
+        nvml_patterns=(r"L40(?!S)",),
+    ),
     "A100_PCIE": GPU(
         gpu_key="A100_PCIE",
         name="NVIDIA A100 80GB PCIe",
@@ -281,7 +318,43 @@ GPUS: dict[str, GPU] = {
         mem_tech="HBM",
         tdp_w=600.0,
         idle_power_w=68.0,
-        nvml_patterns=(r"H200",),
+        # Anchored so it cannot claim an SXM H200. NVML reports the NVL part as
+        # "NVIDIA H200 NVL" and the SXM part as "NVIDIA H200".
+        nvml_patterns=(r"H200\s*NVL",),
+    ),
+    "H200_SXM": GPU(
+        # Same GH100 die and the same quoted tensor throughput as the H100 SXM
+        # (1979 TFLOP/s), so it shares the H100's 1830 MHz tensor clock -- what changes
+        # is memory: 141 GB of HBM3e at 4.8 TB/s against the H100's 80 GB at 3.35 TB/s,
+        # at the same 700 W.
+        #
+        # That makes the H100 SXM / H200 SXM pair the cleanest bandwidth contrast
+        # available anywhere in the fleet: identical compute, identical power budget,
+        # 43% more bandwidth. Every other bandwidth comparison in this project is
+        # confounded with SM count, clock or memory technology at the same time.
+        gpu_key="H200_SXM",
+        name="NVIDIA H200",
+        architecture="Hopper",
+        compute_capability=9.0,
+        sms=132,
+        ops_per_clk=4096,
+        ops_per_clk_fp32acc=4096,
+        ops_per_clk_precision="bf16",
+        fma_per_clk=128,
+        xu_per_clk=16,
+        boost_clock_mhz=1980.0,
+        tensor_clock_mhz=1830.0,
+        max_sm_clock_mhz=1980.0,
+        mem_bandwidth_gbs=4800.0,
+        l2_bandwidth_gbs=8000.0,
+        l2_cache_mb=50.0,
+        smem_bandwidth_b_per_clk_sm=128,
+        smem_size_kb_sm=228.0,
+        regfile_kb_sm=256.0,
+        mem_tech="HBM",
+        tdp_w=700.0,
+        idle_power_w=75.0,
+        nvml_patterns=(r"H200(?!\s*NVL)",),
     ),
 }
 

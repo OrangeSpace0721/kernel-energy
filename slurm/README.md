@@ -26,18 +26,28 @@ physical card months later.
 `FASTEST_FIRST`, orders CUDA devices by capability rather than PCI slot, which breaks the
 index fallback on heterogeneous nodes.
 
-## 2. The energy counter is board-level
+## 2. The energy counter is per board — which is narrower than it sounds
 
-`nvmlDeviceGetTotalEnergyConsumption` reports joules for the whole board. A co-tenant
-process on the same GPU adds its joules to yours, and there is no way to separate them
-afterwards — the contamination is not noise, it is a positive bias that varies with
-whatever the neighbour happens to be doing.
+`nvmlDeviceGetTotalEnergyConsumption` reports joules for **one GPU**, not one node. So a
+job on a *different* GPU of the same node does not contaminate your counter, and
+`--gres=gpu:1` — which already gives you sole use of that GPU — is enough for the
+measurement to be attributable. `--exclusive` is not required for correctness.
 
-So the measure jobs are `--exclusive`, and the harness independently refuses to measure a
-GPU with a foreign compute process on it, re-checking before every kernel rather than only
-at job start. `--allow-shared-gpu` overrides this and stamps `contended=1` on every
-affected row; `merge_results` then prefers a clean measurement of the same kernel wherever
-one exists.
+What a co-tenant *on the same GPU* would do is add their joules to yours with no way to
+separate them, so the harness refuses to measure a GPU carrying a foreign compute process,
+re-checking before every kernel rather than only at job start. This is the guard that
+matters if a site ever enables MPS or GPU sharding. `--allow-shared-gpu` overrides it and
+stamps `contended=1` on every affected row; `merge_results` then prefers a clean
+measurement of the same kernel wherever one exists.
+
+What node sharing *does* affect is **thermal coupling**: neighbours in the same chassis
+raise inlet temperature and can push your card into thermal throttling, which changes its
+energy at fixed work. Real, but second-order, and every row records `temperature_mean_c`
+and `frac_hw_thermal` so it is visible. `submit_measure.sh` therefore sets `--exclusive`
+per card from `KE_GPU_SPEC` — on for small nodes where it is cheap, off for 8-GPU nodes
+where demanding all eight to use one means never running. If you run shared, check
+`frac_hw_thermal` in the quality report afterwards and re-measure exclusively any card
+where it is materially non-zero.
 
 MIG is refused outright. Board energy cannot be attributed to a MIG instance, and unlike
 co-tenancy there is no process list that would reveal the problem after the fact.
@@ -93,7 +103,7 @@ or you get a 401 that reads like a network error.
 ```bash
 # 1. Capture the kernel catalogue -- one array task per model.
 #    Does not need exclusivity: it records shapes and relative times, not energy.
-sbatch --partition=gpu --gres=gpu:1 slurm/01_capture.sbatch
+sbatch --partition=$KE_CAPTURE_PARTITION --gres=gpu:1 slurm/01_capture.sbatch
 
 # 2. Merge the captures (login node, seconds)
 kernelenergy catalogue --in $KE_DATA/catalogue --out $KE_DATA/catalogue.csv
@@ -104,7 +114,7 @@ bash slurm/submit_measure.sh H100 L40S     # or named cards
 KE_MEASURE_ARRAY=0-7 bash slurm/submit_measure.sh H100    # wider split
 
 # 4. Merge, fit, evaluate. No GPU needed.
-sbatch --partition=cpu slurm/03_dataset.sbatch
+sbatch --partition=$KE_CPU_PARTITION slurm/03_dataset.sbatch
 
 # 5. Do the replayed energies reconstruct a real generation? Per card.
 KE_GPU_KEY=H100 sbatch --partition=gpu --gres=gpu:h100:1 slurm/04_validate_e2e.sbatch

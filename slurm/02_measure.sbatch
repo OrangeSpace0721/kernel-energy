@@ -4,23 +4,34 @@
 #SBATCH --error=%x-%A_%a.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --exclusive
 #SBATCH --signal=B:USR1@420
 #SBATCH --requeue
 #SBATCH --open-mode=append
 #
 # The measurement sweep. Submit through slurm/submit_measure.sh, which fills in the
-# partition, constraint and gres for each card -- those differ per site and per GPU, so
+# partition, gres and exclusivity for each card -- those differ per site and per GPU, so
 # they are not baked in here.
 #
-# Three directives above are load-bearing and should not be removed:
+# On exclusivity, precisely
+# -------------------------
+# NVML's energy counter is per *board*, not per node: nvmlDeviceGetTotalEnergyConsumption
+# reports joules for one GPU. So a job on a different GPU of the same node does NOT
+# contaminate your counter, and `--gres=gpu:1` -- which already gives you sole use of that
+# GPU -- is sufficient for the measurement to be attributable.
 #
-#   --exclusive        NVML's energy counter is board-level. A co-tenant process on the
-#                      same GPU adds its joules to yours with no way to separate them
-#                      afterwards, and the contamination is a positive bias that varies
-#                      with whatever the neighbour is doing. The harness refuses to
-#                      measure a contended GPU, so without this the job stalls rather
-#                      than lying -- but stalling still wastes the allocation.
+# What node sharing does affect is thermal coupling. Neighbours in the same chassis raise
+# inlet temperature and can push your card into thermal throttling, which changes its
+# energy at fixed work. That is a real confound, but a second-order one, and every row
+# records `temperature_mean_c` and `frac_hw_thermal` so it is visible rather than assumed
+# away.
+#
+# So `--exclusive` is worth having on small nodes and not worth the queue time on large
+# ones: demanding all eight GPUs of an H100 node to use one is a good way to never run.
+# submit_measure.sh sets it per card from KE_GPU_SPEC. If you do run shared, check
+# `frac_hw_thermal` in the quality report afterwards -- if it is materially non-zero on a
+# card, re-measure that card exclusively before trusting it.
+#
+# Two directives above are load-bearing and should not be removed:
 #
 #   --signal=B:USR1@420
 #                      Sends SIGUSR1 seven minutes before walltime. The sweep catches it,

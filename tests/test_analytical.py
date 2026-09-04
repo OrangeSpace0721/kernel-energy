@@ -289,10 +289,16 @@ def test_power_features_separate_the_cards():
     c = cfg("gemm", m=4096, n=3072, k=3072)
     feats = {k: analyse(make_kernel(c), g).features for k, g in GPUS.items()}
     assert feats["L4"]["log_tdp"] < feats["H100"]["log_tdp"]
-    # Every card must land on a distinct nominal-efficiency value, or the feature
-    # carries no information about which card it is.
-    vals = {k: round(f["log_watt_per_tflop"], 6) for k, f in feats.items()}
-    assert len(set(vals.values())) == len(vals), vals
+
+    # Every card must be distinguishable by the power-domain block *as a whole*. Not by
+    # any single feature: the H100 and H200 SXM share a die, a clock and a 700 W budget,
+    # so their watts-per-TFLOP is identical by construction and only bandwidth separates
+    # them. That is the pair's value, not a defect -- but it does mean the invariant to
+    # test is joint, not marginal.
+    block = ("log_tdp", "log_idle_power", "idle_fraction", "log_watt_per_tflop",
+             "log_watt_per_gbs", "is_hbm", "compute_capability")
+    vecs = {k: tuple(round(f[c], 6) for c in block) for k, f in feats.items()}
+    assert len(set(vecs.values())) == len(vecs), "two cards share a power descriptor"
 
 
 def test_nominal_efficiency_is_not_monotone_in_tdp():
@@ -369,6 +375,57 @@ def test_signature_ignores_provenance():
     b = KernelConfig("gemm", "bf16", {"m": 4608, "n": 9216, "k": 3072},
                      source_model="sd35-large")
     assert a.signature() == b.signature()
+
+
+@pytest.mark.parametrize(
+    "nvml_name,expected",
+    [
+        ("NVIDIA L4", "L4"),
+        ("NVIDIA L40", "L40"),
+        ("NVIDIA L40S", "L40S"),
+        ("NVIDIA A100 80GB PCIe", "A100_PCIE"),
+        ("NVIDIA A100-SXM4-80GB", "A100_SXM4"),
+        ("NVIDIA H100 80GB HBM3", "H100"),
+        ("NVIDIA H100 SXM5 80GB", "H100"),
+        ("NVIDIA H200", "H200_SXM"),
+        ("NVIDIA H200 NVL", "H200_NVL"),
+    ],
+)
+def test_each_card_name_resolves_to_exactly_one_entry(nvml_name, expected):
+    """Near-miss product names must not collide.
+
+    Four pairs in this table differ by a suffix: L4/L40, L40/L40S, H200/H200 NVL,
+    H100/H200. A pattern that swallows its neighbour would silently attribute every row
+    from one card to another's descriptor -- wrong TDP, wrong bandwidth, wrong peak --
+    and the sweep would run to completion looking fine.
+    """
+    import re
+
+    hits = {
+        key for key, gpu in GPUS.items()
+        for pat in gpu.nvml_patterns if re.search(pat, nvml_name, re.IGNORECASE)
+    }
+    assert hits == {expected}, f"{nvml_name!r} matched {sorted(hits)}"
+
+
+def test_l40_and_l40s_differ_only_in_the_power_domain():
+    """The pair is a near-controlled experiment on TDP, so the descriptors must agree
+    everywhere except power -- if they drifted apart on SMs or clock it would stop
+    being one."""
+    a, b = get_gpu("L40"), get_gpu("L40S")
+    assert (a.sms, a.ops_per_clk) == (b.sms, b.ops_per_clk)
+    assert a.mem_bandwidth_gbs == b.mem_bandwidth_gbs
+    assert abs(a.tensor_clock_mhz - b.tensor_clock_mhz) < 1e-9
+    assert a.tdp_w < b.tdp_w
+
+
+def test_h100_and_h200_sxm_differ_only_in_bandwidth():
+    """Same die, same power budget, 43% more bandwidth -- the one clean bandwidth
+    contrast in the fleet, and only clean if nothing else moves."""
+    a, b = get_gpu("H100"), get_gpu("H200_SXM")
+    assert (a.sms, a.ops_per_clk, a.tdp_w) == (b.sms, b.ops_per_clk, b.tdp_w)
+    assert a.tensor_clock_mhz == b.tensor_clock_mhz
+    assert b.mem_bandwidth_gbs > a.mem_bandwidth_gbs * 1.4
 
 
 def test_peak_reproduces_datasheet_from_tensor_clock():

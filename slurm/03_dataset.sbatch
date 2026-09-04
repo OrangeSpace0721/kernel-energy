@@ -11,7 +11,7 @@
 # No GPU: the modelling half is pure NumPy on purpose, so this can run on a CPU
 # partition or on a login node.
 #
-#   sbatch --partition=cpu slurm/03_dataset.sbatch
+#   sbatch --partition=$KE_CPU_PARTITION slurm/03_dataset.sbatch
 
 _here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # shellcheck source=/dev/null

@@ -5,7 +5,7 @@ Kernel-level energy measurement and prediction for diffusion models, re-targetin
 Performance Prediction*, ISCA 2026, arXiv 2601.14910) from latency to energy.
 
 Collects a sample of per-kernel energy from FLUX.1-dev, SD3.5-Large and Qwen-Image across
-the L4 / A100 / L40S / H100 / H200 fleet, and fits PipeWeave's analytical-plus-MLP stack
+an L4 / L40 / L40S / A100 / H100 / H200 fleet, and fits PipeWeave's analytical-plus-MLP stack
 to predict it.
 
 ---
@@ -106,21 +106,21 @@ energy counter at index 0 and you get a different, idle card. Nothing errors, an
 collect a full sweep of plausible numbers that are somebody else's idle draw.
 
 `kernelenergy.hpc` handles that (by UUID, refusing to guess when it cannot be sure), plus
-the three other things a scheduler changes: board-level energy counters make GPU
-exclusivity a correctness requirement rather than a nicety, jobs get killed so the sweep
-has to stop cleanly and resume, and sites cap cards below their datasheet TDP so `pi`
-needs a denominator that reflects the limit that actually binds.
+the three other things a scheduler changes: the energy counter is per GPU so co-tenancy on
+the *same board* has to be guarded against while node sharing mostly costs you thermal
+isolation, jobs get killed so the sweep has to stop cleanly and resume, and sites cap cards
+below their datasheet TDP so `pi` needs a denominator reflecting the limit that binds.
 
 ```bash
 bash slurm/00_setup.sh                          # login node: env + stage weights
-sbatch --partition=gpu --gres=gpu:1 slurm/01_capture.sbatch
+sbatch --partition=$KE_CAPTURE_PARTITION --gres=gpu:1 slurm/01_capture.sbatch
 kernelenergy catalogue --in $KE_DATA/catalogue --out $KE_DATA/catalogue.csv
 bash slurm/submit_measure.sh                    # one sharded array job per card
-sbatch --partition=cpu slurm/03_dataset.sbatch  # merge, fit, evaluate
+sbatch --partition=$KE_CPU_PARTITION slurm/03_dataset.sbatch  # merge, fit, evaluate
 ```
 
-Edit `slurm/config.sh` — paths, conda, and the partition/constraint/gres per card — and
-nothing else should need changing.
+Edit `slurm/config.sh` — paths, conda, and the partition/gres/exclusivity per card. It
+ships filled in for Iridis X; nothing else should need changing.
 
 ## Install
 

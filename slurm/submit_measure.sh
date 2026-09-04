@@ -30,9 +30,9 @@ fi
 mkdir -p "$KE_LOGS"
 
 for key in "${targets[@]}"; do
-  partition="$(ke_gpu_field "$key" 1)"
-  constraint="$(ke_gpu_field "$key" 2)"
-  gres="$(ke_gpu_field "$key" 3)"
+  partition="$(ke_gpu_field "$key" 1)" || continue
+  gres="$(ke_gpu_field "$key" 2)"
+  exclusive="$(ke_gpu_field "$key" 3)"
 
   args=(
     --job-name="ke-$key"
@@ -46,11 +46,13 @@ for key in "${targets[@]}"; do
     --error="$KE_LOGS/ke-$key-%A_%a.out"
     --export="ALL,KE_GPU_KEY=$key"
   )
-  [[ -n "$constraint" ]] && args+=(--constraint="$constraint")
+  # Exclusive buys thermal isolation, not counter correctness -- gres already gives sole
+  # use of the GPU. Worth it on small nodes, not worth the queue on 8-GPU ones.
+  [[ "$exclusive" == "yes" ]] && args+=(--exclusive)
   # shellcheck disable=SC2046
   args+=($(ke_account_flag))
 
-  echo "submitting $key: partition=$partition constraint=${constraint:-none} gres=$gres array=$KE_MEASURE_ARRAY"
+  echo "submitting $key: partition=$partition gres=$gres exclusive=$exclusive array=$KE_MEASURE_ARRAY"
   sbatch "${args[@]}" "$_here/02_measure.sbatch"
 done
 
