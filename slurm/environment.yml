@@ -1,0 +1,32 @@
+name: kernelenergy
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+
+  # The numeric stack comes from conda so it links against the MKL/OpenBLAS the site
+  # provides; everything torch-adjacent comes from pip, because the conda builds lag and
+  # a mismatched CUDA runtime is a bad afternoon.
+  - numpy>=1.24
+  - pandas>=2.0
+  - scipy>=1.10
+  - scikit-learn>=1.3
+
+  - pip:
+      # Pin the CUDA build to match the driver on your nodes. cu124 wheels need driver
+      # >= 550; `nvidia-smi` in the top-right shows yours. If the driver is older, use
+      # the cu121 index instead.
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+      - torch>=2.4
+      - diffusers>=0.35        # Qwen-Image needs >= 0.35
+      - transformers>=4.45
+      - accelerate>=1.0
+      - safetensors
+      - sentencepiece
+      - protobuf
+      - nvidia-ml-py>=12.535   # NVML bindings; imports as `pynvml`
+      - huggingface_hub>=0.26
+      - pytest>=7.4
