@@ -33,7 +33,7 @@ kernelenergy preflight --stage all --models "$MODEL" --device 0 \
 for steps in 4 20; do
   echo
   echo "--- $steps steps ---"
-  srun --unbuffered python "$_here/../scripts/validate_e2e.py" \
+  python "$_here/../scripts/validate_e2e.py" \
     --dataset   "$KE_DATA/dataset.csv" \
     --catalogue "$KE_DATA/catalogue.csv" \
     --model "$MODEL" \

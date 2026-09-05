@@ -61,9 +61,13 @@ kernelenergy preflight \
   --catalogue "$KE_DATA/catalogue.csv" \
   --out "$KE_DATA/raw" || exit 1
 
+# Run through ke_run_forwarding_signals, NOT srun. See the comment on that function in
+# job_common.sh: --signal=B:USR1 goes to this bash process, so the sweep only hears about
+# an imminent walltime kill if bash passes it down.
+#
 # --time-budget 0 derives the budget from the job's own remaining walltime, so the sweep
 # stops before starting a measurement it cannot finish.
-srun --unbuffered kernelenergy measure \
+ke_run_forwarding_signals kernelenergy measure \
   --catalogue "$KE_DATA/catalogue.csv" \
   --out "$KE_DATA/raw" \
   --device 0 \

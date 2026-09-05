@@ -26,7 +26,8 @@ for key in "${!KE_GPU_SPEC[@]}"; do
   partition="$(ke_gpu_field "$key" 1)"
   gres="$(ke_gpu_field "$key" 2)"
 
-  out=$(timeout 300 srun --partition="$partition" --gres="$gres" \
+  # --nodes=1 is mandatory on some sites (Iridis rejects srun without it).
+  out=$(timeout 300 srun --nodes=1 --ntasks=1 --partition="$partition" --gres="$gres" \
           --time=00:02:00 --cpus-per-task=1 --mem=4G \
           $(ke_account_flag) \
           nvidia-smi --query-gpu="$QUERY" --format=csv,noheader 2>&1 | head -1)

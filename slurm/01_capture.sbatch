@@ -34,7 +34,7 @@ echo "capturing: $MODEL"
 # Fail early and cheaply if the weights are not staged, rather than 20 minutes in.
 kernelenergy preflight --stage capture --models "$MODEL" --device 0 || exit 1
 
-srun kernelenergy capture \
+kernelenergy capture \
   --model "$MODEL" \
   --out "$KE_DATA/catalogue" \
   --steps 1 \

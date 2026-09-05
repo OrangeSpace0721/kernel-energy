@@ -43,6 +43,37 @@ conda activate "$KE_ENV_NAME"
 
 mkdir -p "$KE_DATA" "$KE_LOGS"
 
+# Run a command as a child, forwarding the scheduler's warning signals to it.
+#
+# This exists because of how `--signal=B:USR1@420` works: the `B:` prefix means SLURM
+# signals the *batch script* -- the bash process -- and not any job step beneath it. So
+# `srun kernelenergy measure ...` gets the job killed rather than warned: bash receives
+# SIGUSR1, whose default action is to terminate, and the Python process that knows how to
+# stop cleanly never hears about it. The sweep's whole walltime and preemption handling
+# is downstream of this, so without the forwarding it is dead code.
+#
+# `wait` returns as soon as a trapped signal arrives, with status 128+n, which is not the
+# child exiting -- hence the loop.
+ke_run_forwarding_signals() {
+  "$@" &
+  local child=$!
+  # shellcheck disable=SC2064  # $child must expand now, not at trap time
+  trap "kill -USR1 $child 2>/dev/null || true" USR1
+  trap "kill -TERM $child 2>/dev/null || true" TERM
+  trap "kill -INT  $child 2>/dev/null || true" INT
+
+  local status=0
+  while true; do
+    wait "$child"; status=$?
+    if (( status > 128 )) && kill -0 "$child" 2>/dev/null; then
+      continue          # our wait was interrupted; the child is still going
+    fi
+    break
+  done
+  trap - USR1 TERM INT
+  return $status
+}
+
 ke_banner() {
   echo "=============================================================="
   echo "job      : ${SLURM_JOB_ID:-local} ${SLURM_ARRAY_TASK_ID:+task $SLURM_ARRAY_TASK_ID}"
