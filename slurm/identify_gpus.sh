@@ -99,9 +99,16 @@ fi
 # --------------------------------------------------------------------------- #
 # 3. Poll. Safe to interrupt -- re-run with --collect.
 # --------------------------------------------------------------------------- #
-echo
-echo "=== waiting for probes (Ctrl-C is safe; re-run with --collect) ==="
-deadline=$(( SECONDS + ${KE_ID_WAIT:-900} ))
+# --collect reports what has landed and returns immediately -- the point of it is to
+# check on probes submitted earlier, not to start waiting again. Set KE_ID_WAIT to poll
+# anyway.
+if [[ "$MODE" == "collect" && -z "${KE_ID_WAIT:-}" ]]; then
+  deadline=$SECONDS
+else
+  echo
+  echo "=== waiting for probes (Ctrl-C is safe; the jobs keep running) ==="
+  deadline=$(( SECONDS + ${KE_ID_WAIT:-900} ))
+fi
 while (( SECONDS < deadline )); do
   pending=0
   for key in "${!KE_GPU_SPEC[@]}"; do
