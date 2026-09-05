@@ -195,6 +195,7 @@ def run_preflight(
 
     # -- offline model cache (capture only) ---------------------------------- #
     if want_capture:
+        checks.extend(_check_diffusers(models))
         checks.extend(_check_hf_cache(models))
     else:
         checks.append(_skip("hf.cache", "measure does not load the pipelines"))
@@ -222,6 +223,40 @@ def run_preflight(
             checks.append(_fail("io.out_dir", f"{p}: {e}"))
 
     return checks
+
+
+def _check_diffusers(models: tuple[str, ...]) -> list[Check]:
+    """Is the pipeline class this model needs actually in the installed diffusers?
+
+    Cheap to check and expensive to discover late. Qwen-Image needs diffusers >= 0.35;
+    on an older build the capture job loads, allocates, and then dies on an AttributeError
+    after however long the queue took. Worse in an array job, where the other two tasks
+    succeed and the failure is one line in one log.
+    """
+    out: list[Check] = []
+    try:
+        import diffusers
+    except ImportError as e:
+        return [_fail("diffusers.import", f"{e}. Install with the [gpu] extra.")]
+
+    from kernelenergy.trace.pipelines import PIPELINES
+
+    out.append(_ok("diffusers.version", diffusers.__version__))
+
+    for key in (models or tuple(PIPELINES)):
+        spec = PIPELINES.get(key)
+        if spec is None:
+            out.append(_fail(f"diffusers.{key}", "unknown pipeline key"))
+            continue
+        if getattr(diffusers, spec.loader, None) is None:
+            out.append(_fail(
+                f"diffusers.{key}",
+                f"{spec.loader} is not in diffusers {diffusers.__version__}. "
+                f"Upgrade (pip install -U diffusers), or drop {key} from this run.",
+            ))
+        else:
+            out.append(_ok(f"diffusers.{key}", spec.loader))
+    return out
 
 
 def _check_hf_cache(models: tuple[str, ...]) -> list[Check]:
