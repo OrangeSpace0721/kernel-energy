@@ -11,10 +11,43 @@ export KE_DATA="${KE_DATA:-$KE_ROOT/data}"
 export KE_LOGS="${KE_LOGS:-$KE_ROOT/logs}"
 export KE_ENV_NAME="${KE_ENV_NAME:-kernelenergy}"
 
-# HuggingFace cache. Over 100 GB across the three pipelines, so it must be on scratch,
-# not home, and shared so six cards do not each pull their own copy.
+# --- model weights ----------------------------------------------------------
+# Over 100 GB across the three pipelines, so never download twice. Two ways to reuse
+# what you already have; check which layout yours is with `ls`:
+#
+#   1. A HUB CACHE -- contains a `hub/` dir, or `models--org--name/` entries directly.
+#      Point HF_HOME at it and nothing else changes; repo ids resolve offline.
+#
+#        export HF_HOME=/scratch/$USER/existing/huggingface
+#
+#   2. A PLAIN PIPELINE DIRECTORY -- contains model_index.json, model files in
+#      subfolders (transformer/, vae/, text_encoder/...). This is what `git clone` or
+#      `snapshot_download(local_dir=...)` gives you, and the hub client cannot find it
+#      from a repo id. Name the path per pipeline instead:
+#
+#        export KE_MODEL_FLUX1_DEV=/scratch/$USER/models/FLUX.1-dev
+#        export KE_MODEL_SD35_LARGE=/scratch/$USER/models/stable-diffusion-3.5-large
+#        export KE_MODEL_QWEN_IMAGE=/scratch/$USER/models/Qwen-Image
+#
+# The two can be mixed -- override the ones you already have, let the rest come from
+# the cache. `kernelenergy preflight --stage capture` prints exactly which path each
+# pipeline resolved to, so run it before committing an allocation.
 export HF_HOME="${HF_HOME:-$KE_ROOT/hf}"
 export HF_HUB_ENABLE_HF_TRANSFER=1
+
+# Reusing the teacher snapshots from the distillation project. These are the stock
+# pretrained pipelines, which is exactly what this measures -- no download needed.
+#
+# One caveat worth checking once (`kernelenergy preflight --stage capture` does it):
+# a distillation project sometimes keeps only the denoiser, since that is all the
+# student needs. This harness runs the whole pipeline, so each directory must be a
+# complete snapshot -- model_index.json at the top, plus vae/, text_encoder*/ and
+# tokenizer*/ beside the transformer. If one turns out to be transformer-only, leave
+# that KE_MODEL_* unset and 00_setup.sh will fetch the full pipeline for it alone.
+KE_TEACHERS="${KE_TEACHERS:-/iridisfs/scratch/$USER/model_distillation/Model-Distillation}"
+export KE_MODEL_FLUX1_DEV="${KE_MODEL_FLUX1_DEV:-$KE_TEACHERS/flux1_teacher}"
+export KE_MODEL_SD35_LARGE="${KE_MODEL_SD35_LARGE:-$KE_TEACHERS/sd3.5_large_teacher}"
+export KE_MODEL_QWEN_IMAGE="${KE_MODEL_QWEN_IMAGE:-$KE_TEACHERS/qwen_teacher}"
 
 # --- conda ------------------------------------------------------------------
 # Set this to the output of `conda info --base` plus /etc/profile.d/conda.sh.

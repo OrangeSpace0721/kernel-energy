@@ -47,10 +47,24 @@ export HF_HUB_ENABLE_HF_TRANSFER=1
 python - <<'PY'
 import os, sys
 from huggingface_hub import snapshot_download
-from kernelenergy.trace.pipelines import PIPELINES
+from kernelenergy.trace.pipelines import PIPELINES, env_var_for, resolve_source
 
 failed = []
 for key, spec in PIPELINES.items():
+    # Anything already on disk -- a KE_MODEL_* override, or a hub cache HF_HOME already
+    # points at -- is left alone. Re-downloading 40 GB you have is the single most
+    # expensive mistake available at this step.
+    var = env_var_for(key)
+    if os.environ.get(var, "").strip():
+        try:
+            src, _ = resolve_source(key)
+            print(f"\n=== {key}: using {var}={src} (skipping download) ===", flush=True)
+            continue
+        except Exception as e:
+            print(f"\n=== {key}: {var} is set but unusable: {e} ===", flush=True)
+            failed.append((key, var, str(e)))
+            continue
+
     print(f"\n=== {key}: {spec.repo} ===", flush=True)
     try:
         # Skip the duplicate .bin copies where safetensors exist; roughly halves the

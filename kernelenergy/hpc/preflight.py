@@ -231,43 +231,73 @@ def _check_hf_cache(models: tuple[str, ...]) -> list[Check]:
     error that names a URL rather than a missing file, minutes into a job. Checking the
     cache up front turns that into one line.
     """
-    from kernelenergy.trace.pipelines import PIPELINES
+    from kernelenergy.trace.pipelines import PIPELINES, env_var_for, resolve_source
 
     out: list[Check] = []
-    home = os.environ.get("HF_HOME") or os.environ.get("HUGGINGFACE_HUB_CACHE") or ""
+    home = (
+        os.environ.get("HF_HOME")
+        or os.environ.get("HF_HUB_CACHE")
+        or os.environ.get("HUGGINGFACE_HUB_CACHE")
+        or ""
+    )
     offline = os.environ.get("HF_HUB_OFFLINE", "") in ("1", "true", "True")
 
-    if not home:
+    wanted = models or tuple(PIPELINES)
+    # A pipeline pointed at a local directory does not need the hub cache at all, so
+    # only complain about HF_HOME if something still resolves through it.
+    overridden = {k for k in wanted if os.environ.get(env_var_for(k), "").strip()}
+    needs_hub = set(wanted) - overridden
+
+    if not home and needs_hub:
         out.append(_warn(
             "hf.home",
             "HF_HOME is unset, so weights resolve to ~/.cache/huggingface -- usually a "
-            "small home quota on HPC. Point it at shared scratch.",
+            "small home quota on HPC. Point it at shared scratch, or set "
+            "KE_MODEL_<KEY> to a pipeline directory you already have.",
         ))
-    else:
+    elif home:
         out.append(_ok("hf.home", home))
+    else:
+        out.append(_skip("hf.home", "every pipeline is pointed at a local directory"))
 
     root = Path(home or Path.home() / ".cache" / "huggingface")
     hub = root / "hub" if (root / "hub").exists() else root
 
-    wanted = models or tuple(PIPELINES)
-    missing = []
+    missing, found = [], []
     for key in wanted:
         spec = PIPELINES.get(key)
         if spec is None:
             missing.append(f"{key} (unknown pipeline)")
             continue
+        if key in overridden:
+            # Validate the override itself -- resolve_source raises with a specific
+            # message (wrong path, or a hub cache handed to the wrong variable).
+            try:
+                src, _how = resolve_source(key)
+                found.append(f"{key} <- {src}")
+            except Exception as e:
+                missing.append(f"{key}: {e}")
+            continue
         stub = "models--" + spec.repo.replace("/", "--")
-        if not (hub / stub).exists():
-            missing.append(f"{key} -> {spec.repo}")
+        if (hub / stub).exists():
+            found.append(f"{key} <- {hub / stub}")
+        else:
+            missing.append(f"{key} -> {spec.repo} (not in {hub})")
 
     if missing:
         out.append(_fail(
             "hf.cache",
-            "not in the cache: " + "; ".join(missing)
-            + f".  Run slurm/00_stage_models.sh on a login node first (cache root {hub})",
+            "cannot resolve: " + "; ".join(missing)
+            + ".  Either run slurm/00_setup.sh on a login node, point HF_HOME at an "
+            "existing hub cache, or set KE_MODEL_<KEY> to a pipeline directory.",
         ))
     else:
-        out.append(_ok("hf.cache", f"all {len(wanted)} pipeline(s) present under {hub}"))
+        detail = f"all {len(wanted)} pipeline(s) resolvable"
+        if overridden:
+            detail += f" ({len(overridden)} via KE_MODEL_* override)"
+        out.append(_ok("hf.cache", detail))
+        for line in found:
+            out.append(_ok("hf.cache.path", line))
 
     out.append(
         _ok("hf.offline", "HF_HUB_OFFLINE=1")
