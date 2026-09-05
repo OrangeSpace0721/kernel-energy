@@ -55,8 +55,8 @@ co-tenancy there is no process list that would reveal the problem after the fact
 ## 3. Jobs get killed
 
 `--signal=B:USR1@420` warns seven minutes before walltime. The sweep catches it, finishes
-the kernel in flight, flushes, and exits **64** meaning "clean stop, work remains" — which
-`02_measure.sbatch` turns into a requeue. Starting a 12-second measurement with 4 seconds
+the kernel in flight, flushes, and exits **64** meaning "clean stop, work remains". Iridis disables `--requeue`, so
+recovery is a manual resubmit — one command, and it skips everything already measured. Starting a 12-second measurement with 4 seconds
 left is worse than skipping it, because a truncated window would be written as if it were
 real, so the sweep also stops when the next kernel does not fit in the remaining walltime.
 

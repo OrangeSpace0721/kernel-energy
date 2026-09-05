@@ -5,7 +5,6 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --signal=B:USR1@420
-#SBATCH --requeue
 #SBATCH --open-mode=append
 #
 # The measurement sweep. Submit through slurm/submit_measure.sh, which fills in the
@@ -39,8 +38,11 @@
 #                      Killed instead at the wall, it loses the kernel in flight and may
 #                      leave a partial row.
 #
-#   --requeue          Lets a preempted task come back. The sweep is resumable, so a
-#                      requeued task skips everything already recorded and continues.
+# There is deliberately NO --requeue: Iridis rejects it outright ("requeue has been
+# disabled"), and sbatch fails the whole submission rather than warning. So recovery is
+# manual, which costs one command and nothing else -- the sweep is resumable, so
+# re-running submit_measure.sh skips every (kernel_sig, gpu_key) already on disk and
+# picks up exactly where the eviction left off.
 #
 # Exit 64 means "stopped cleanly, work remains" -- see the trailer below.
 
@@ -98,11 +100,18 @@ status=$?
 echo "finished with status $status at $(date -Is)"
 
 if [[ $status -eq 64 ]]; then
-  # Clean stop with work remaining -- walltime or a preemption signal. Requeue this
-  # exact array task; it will resume from the rows already on disk.
-  echo "work remains; requeueing ${SLURM_JOB_ID}"
-  scontrol requeue "${SLURM_JOB_ID}" || \
-    echo "requeue failed -- resubmit manually, the sweep is resumable"
+  # Clean stop with work remaining: walltime ran out, or the scheduler warned us of a
+  # preemption. Everything measured so far is flushed to disk and valid.
+  echo
+  echo "=============================================================="
+  echo "STOPPED CLEANLY WITH WORK REMAINING on $GPU_KEY"
+  echo "Nothing is lost. To continue, resubmit -- already-measured configs are skipped:"
+  echo
+  echo "    bash \$KE_SLURM_DIR/submit_measure.sh $GPU_KEY"
+  echo
+  echo "Progress so far:  bash \$KE_SLURM_DIR/status.sh"
+  echo "=============================================================="
+  # Exit 0 so the job is not recorded as failed; the message above is the signal.
   exit 0
 fi
 
