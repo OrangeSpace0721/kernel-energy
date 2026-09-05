@@ -78,24 +78,35 @@ export KE_PRE_ACTIVATE="${KE_PRE_ACTIVATE:-}"   # e.g. "module load conda"
 # is per board, so exclusive is about thermal isolation only. Set on the small nodes
 # where it is cheap; left off on the 8-GPU nodes where it would mean queueing for seven
 # idle cards.
+# gres names confirmed against `sinfo -h -p <part> -o '%G'` on 2026-09-05. Note the
+# swarm partitions use "a100swarm" / "h100swarm", not the "a100sw" / "h100sw" that
+# sinfo's default %10G column shows -- that column truncates, and a truncated gres name
+# fails as "Requested node configuration is not available", which reads like the
+# partition being full rather than a typo. `identify_gpus.sh --gres` prints them
+# untruncated and flags mismatches.
 declare -gA KE_GPU_SPEC=(
-  #                 partition       gres          exclusive
-  [A100_PCIE]="a100|gpu:a100:1|yes"            # rose[02-13], 2/node, 2d12h
-  [A100_SXM4]="swarm_a100|gpu:a100sw:1|no"     # swarma, 4/node, 5d
-  [H100]="swarm_h100|gpu:h100sw:1|no"          # swarmh, 8/node, 5d
-  [H200_SXM]="quad_h200|gpu:h200:1|no"         # blossom[01-04], 4/node, 2d12h
-  [L4]="l4|gpu:l4:1|no"                        # cotton[01-02], 8/node, 2d12h
-  [L40]="l40|gpu:l40:1|yes"                    # coral01, 8/node, single node
+  #                 partition       gres              exclusive
+  [A100_PCIE]="a100|gpu:a100:1|yes"                 # rose[02-13], 2/node, 2d12h
+  [A100_SXM4]="swarm_a100|gpu:a100swarm:1|no"       # swarma, 4/node, 5d
+  [H100]="swarm_h100|gpu:h100swarm:1|no"            # swarmh, 8/node, 5d
+  [H200_SXM]="quad_h200|gpu:h200:1|no"              # blossom[01-04], 4/node, 2d12h
+  [L4]="l4|gpu:l4:1|no"                             # cotton[01-02], 8/node, 2d12h
+  [L40]="l40|gpu:l40:1|yes"                         # coral01, 8/node, single node
 )
 
-# Scavenger equivalents: same hardware, 12 h limit, preemptible. Free-er to get, and the
-# sweep is built to survive preemption -- it catches the signal, flushes, and requeues.
-# Use these when the main partitions are busy; widen KE_MEASURE_ARRAY so each task holds
-# a node for less time and loses less when evicted.
+# Scavenger equivalents: same hardware, 12 h limit, preemptible. Much easier to get, and
+# the sweep is built to survive preemption -- it catches the signal, finishes the kernel
+# in flight, flushes and requeues, so an eviction costs one kernel rather than the run.
+# On a cluster where the main GPU partitions queue for days, this is the faster route to
+# a complete dataset, not a compromise.
+#
+# Widen KE_MEASURE_ARRAY when using these so each task holds a node for less time.
+# scavenger_l4 spans two node types (ecsai and swarml), so its gres is left as plain
+# gpu:1 rather than assuming both advertise the same name.
 declare -gA KE_GPU_SPEC_SCAVENGER=(
-  [A100_SXM4]="scavenger_4a100|gpu:a100sw:1|no"
-  [H100]="scavenger_8h100|gpu:h100sw:1|no"
-  [L4]="scavenger_l4|gpu:l4swar:1|no"
+  [A100_SXM4]="scavenger_4a100|gpu:a100swarm:1|no"
+  [H100]="scavenger_8h100|gpu:h100swarm:1|no"
+  [L4]="scavenger_l4|gpu:1|no"
 )
 if [[ "${KE_USE_SCAVENGER:-0}" == "1" ]]; then
   for k in "${!KE_GPU_SPEC_SCAVENGER[@]}"; do
