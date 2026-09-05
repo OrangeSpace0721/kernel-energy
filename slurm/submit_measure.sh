@@ -15,17 +15,43 @@ _here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "$_here/config.sh"
 
+DRY_RUN=0
+targets=()
+for a in "$@"; do
+  case "$a" in
+    -n|--dry-run) DRY_RUN=1 ;;
+    -*) echo "unknown flag: $a" >&2; exit 2 ;;
+    *) targets+=("$a") ;;
+  esac
+done
+
 if [[ ! -f "$KE_DATA/catalogue.csv" ]]; then
   echo "no catalogue at $KE_DATA/catalogue.csv" >&2
-  echo "run 01_capture.sbatch first, then:" >&2
+  echo "the catalogue is captured ONCE, on any single GPU -- kernel shapes do not" >&2
+  echo "depend on the hardware. Run:" >&2
+  echo "  bash slurm/submit_capture.sh" >&2
   echo "  kernelenergy catalogue --in $KE_DATA/catalogue --out $KE_DATA/catalogue.csv" >&2
   exit 1
 fi
 
-targets=("$@")
 if [[ ${#targets[@]} -eq 0 ]]; then
   targets=("${!KE_GPU_SPEC[@]}")
 fi
+
+# Two partitions pointing at the same physical card is the failure mode worth catching
+# here, because it is silent downstream: both sweeps would write the same gpu_key, and
+# merge_results deduplicates on (kernel_sig, gpu_key) -- so one card's rows would
+# overwrite the other's and the fold would quietly train on five cards instead of six.
+declare -A _seen_partition=()
+for key in "${targets[@]}"; do
+  p="$(ke_gpu_field "$key" 1)" || exit 1
+  if [[ -n "${_seen_partition[$p]:-}" ]]; then
+    echo "config error: $key and ${_seen_partition[$p]} both use partition '$p'." >&2
+    echo "One of them is pointing at the wrong hardware. Run identify_gpus.sh." >&2
+    exit 1
+  fi
+  _seen_partition[$p]="$key"
+done
 
 mkdir -p "$KE_LOGS"
 
@@ -52,10 +78,22 @@ for key in "${targets[@]}"; do
   # shellcheck disable=SC2046
   args+=($(ke_account_flag))
 
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf '%-12s partition=%-14s gres=%-16s exclusive=%-4s array=%s\n' \
+      "$key" "$partition" "$gres" "$exclusive" "$KE_MEASURE_ARRAY"
+    continue
+  fi
+
   echo "submitting $key: partition=$partition gres=$gres exclusive=$exclusive array=$KE_MEASURE_ARRAY"
   sbatch "${args[@]}" "$_here/02_measure.sbatch"
 done
 
+if [[ $DRY_RUN -eq 1 ]]; then
+  echo
+  echo "(dry run -- nothing submitted; drop -n to go)"
+  exit 0
+fi
+
 echo
-echo "watch with:  squeue -u \$USER -o '%.18i %.12j %.8T %.10M %R'"
+echo "watch with:  bash slurm/status.sh"
 echo "logs in:     $KE_LOGS"

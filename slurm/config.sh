@@ -6,6 +6,9 @@
 
 # --- paths (shared scratch, visible from every compute node) -----------------
 # Iridis puts scratch at /scratch/<username> and does not export $SCRATCH.
+# Some batch environments do not export USER either, and every path below depends on
+# it, so derive it rather than trusting it.
+export USER="${USER:-$(id -un)}"
 export KE_ROOT="${KE_ROOT:-/scratch/$USER/kernel-energy}"
 export KE_DATA="${KE_DATA:-$KE_ROOT/data}"
 export KE_LOGS="${KE_LOGS:-$KE_ROOT/logs}"
@@ -111,7 +114,15 @@ export KE_CPUS="${KE_CPUS:-8}"
 export KE_MEM="${KE_MEM:-64G}"
 export KE_ACCOUNT="${KE_ACCOUNT:-}"
 
-ke_account_flag() { [[ -n "$KE_ACCOUNT" ]] && echo "--account=$KE_ACCOUNT"; }
+ke_account_flag() {
+  # The explicit `return 0` is load-bearing. Without it the function's exit status is
+  # that of the `[[ -n ... ]]` test, which is 1 whenever KE_ACCOUNT is empty -- and the
+  # submit scripts run under `set -e`, so they would die at the first card having
+  # submitted nothing and printed no error. A silent no-op is the worst possible failure
+  # for a script whose whole job is to launch work.
+  [[ -n "$KE_ACCOUNT" ]] && echo "--account=$KE_ACCOUNT"
+  return 0
+}
 
 ke_gpu_field() {  # $1 = gpu key, $2 = 1|2|3 for partition|gres|exclusive
   local spec="${KE_GPU_SPEC[$1]:-}"
