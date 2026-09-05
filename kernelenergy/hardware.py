@@ -184,24 +184,29 @@ GPUS: dict[str, GPU] = {
         nvml_patterns=(r"L40S",),
     ),
     "L40": GPU(
-        # The L40S's quieter sibling: same AD102 die, same 142 SMs, near-identical
-        # clocks -- and a 300 W board instead of 350 W, with NVIDIA quoting its tensor
-        # throughput at FP32 accumulate (362 TFLOP/s) where the L40S is quoted at FP16
-        # accumulate (733). The descriptor difference is therefore almost entirely
-        # *power*, which makes the pair unusually informative for an energy model:
-        # two cards at the same point in SM/clock space with different budgets is a
-        # near-controlled experiment on what TDP alone does to achieved efficiency.
-        # Note this does not answer the L40S extrapolation problem in
-        # machine-descriptor-pipeweave.md §3 -- it duplicates the L40S's position
-        # rather than bracketing it -- but it does make that position no longer a
-        # single point.
+        # NOTE: ops_per_clk is 512 here, NOT the 1024 that machine-descriptor-pipeweave.md
+        # §1 assigns to "Ada". The L40 is a genuine counterexample to the one-constant-
+        # per-architecture rule: same AD102 die and same 142 SMs as the L40S, same 2490 MHz,
+        # same 864 GB/s -- and exactly half the tensor throughput. NVIDIA quotes BF16 at
+        # 362 TFLOP/s sparse against the L40S's 724, which under
+        # `clock = peak / (SMs * ops_per_clk)` forces 512.
+        #
+        # Assigning 1024 here would overstate the peak by 2x, and the damage would be
+        # silent: utilisation halves, eta halves, and the card simply looks inefficient.
+        #
+        # What the pair is good for, then, is not the TDP contrast it first appears to be.
+        # It varies **ops_per_clk alone** with SM count, clock and bandwidth all held
+        # fixed -- which is exactly the isolated variation §2's decomposition
+        # `log peak = log SMs + log ops/clk + log clock` needs to identify phi_ops/clk,
+        # and which nothing else in the fleet provides. Every other pair moves two or
+        # three of those factors together.
         gpu_key="L40",
         name="NVIDIA L40",
         architecture="Ada",
         compute_capability=8.9,
         sms=142,
-        ops_per_clk=1024,
-        ops_per_clk_fp32acc=512,
+        ops_per_clk=512,
+        ops_per_clk_fp32acc=256,
         ops_per_clk_precision="bf16",
         fma_per_clk=128,
         xu_per_clk=16,

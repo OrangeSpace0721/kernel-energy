@@ -408,15 +408,51 @@ def test_each_card_name_resolves_to_exactly_one_entry(nvml_name, expected):
     assert hits == {expected}, f"{nvml_name!r} matched {sorted(hits)}"
 
 
-def test_l40_and_l40s_differ_only_in_the_power_domain():
-    """The pair is a near-controlled experiment on TDP, so the descriptors must agree
-    everywhere except power -- if they drifted apart on SMs or clock it would stop
-    being one."""
+def test_l40_and_l40s_isolate_ops_per_clk():
+    """The pair varies ops_per_clk alone, with SMs, clock and bandwidth held fixed.
+
+    An earlier version of this test asserted the two cards had *equal* ops_per_clk,
+    encoding the assumption that Ada means 1024 everywhere. It passed, because the table
+    had been written from the same assumption -- which is how a 2x error in the L40's
+    peak survived. The datasheet is the authority: BF16 sparse is 362 TFLOP/s for the
+    L40 against 724 for the L40S, on the same die at the same clock.
+    """
     a, b = get_gpu("L40"), get_gpu("L40S")
-    assert (a.sms, a.ops_per_clk) == (b.sms, b.ops_per_clk)
+    assert a.sms == b.sms
     assert a.mem_bandwidth_gbs == b.mem_bandwidth_gbs
     assert abs(a.tensor_clock_mhz - b.tensor_clock_mhz) < 1e-9
+    assert b.ops_per_clk == 2 * a.ops_per_clk
+    assert b.peak_tensor_flops() == pytest.approx(2 * a.peak_tensor_flops())
     assert a.tdp_w < b.tdp_w
+
+
+@pytest.mark.parametrize(
+    "key,sparse_bf16_tflops",
+    [
+        ("L4", 242.0),
+        ("L40", 362.0),
+        ("L40S", 724.0),
+        ("A100_PCIE", 624.0),
+        ("A100_SXM4", 624.0),
+        ("H100", 1979.0),
+        ("H200_NVL", 1671.0),
+        ("H200_SXM", 1979.0),
+    ],
+)
+def test_peak_matches_the_published_bf16_figure(key, sparse_bf16_tflops):
+    """Every row must reproduce its datasheet BF16-with-sparsity number to ~1%.
+
+    This is the check that would have caught the L40 error immediately, and it is worth
+    having because the failure mode is invisible downstream: a peak that is 2x too high
+    just makes a card look half as efficient as it is, which is indistinguishable from a
+    card that really is slow. Whatever convention the fleet uses -- this one is sparse
+    BF16 throughout -- it has to be applied uniformly, and only a comparison against
+    published figures can confirm that.
+    """
+    got = get_gpu(key).peak_tensor_flops("tensor") / 1e12
+    assert got == pytest.approx(sparse_bf16_tflops, rel=0.01), (
+        f"{key}: table gives {got:.1f} TFLOP/s, datasheet says {sparse_bf16_tflops}"
+    )
 
 
 def test_h100_and_h200_sxm_differ_only_in_bandwidth():
