@@ -58,7 +58,7 @@ args=(
   --mem="${KE_CAPTURE_MEM:-160G}"
   --output="$KE_LOGS/ke-capture-%A_%a.out"
   --error="$KE_LOGS/ke-capture-%A_%a.out"
-  --export=ALL
+  --export="ALL,KE_SLURM_DIR=$_here"
 )
 # shellcheck disable=SC2046
 args+=($(ke_account_flag))

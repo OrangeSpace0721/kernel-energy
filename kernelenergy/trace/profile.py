@@ -23,21 +23,51 @@ __all__ = ["profile_pipeline", "categorise_kernel", "coverage_report", "KERNEL_P
 #: Ordered: the first match wins, so more specific patterns come first.
 KERNEL_PATTERNS: list[tuple[str, str]] = [
     ("attention", r"flash|fmha|attention|mha_|sdpa|cudnn_.*attn"),
-    ("gemm", r"gemm|cutlass|sm\d+_.*_tensorop|nvjet|ampere_\w*gemm|cublas"),
-    ("conv", r"conv|implicit_gemm|winograd|cudnn::"),
-    ("norm", r"layer_?norm|rms_?norm|group_?norm|native_layer_norm|batch_norm"),
-    ("elementwise", r"elementwise|vectorized_elementwise|gelu|silu|swish|"
-                    r"unrolled_elementwise|CatArrayBatchedCopy|copy_|fill_|mul_|add_"),
+    ("conv", r"conv|winograd|cudnn::|implicit_gemm"),
+    # Normalisation kernels are named after the *statistic* they compute, not after the
+    # layer: PyTorch's LayerNorm/GroupNorm land as RowwiseMoments and Welford kernels,
+    # and RMSNorm shows up as a MeanOps/NormTwoOps reduction. Matching only on "norm"
+    # sends 3-4% of runtime to `other` and makes it look uncovered.
+    ("norm", r"layer_?norm|rms_?norm|group_?norm|batch_norm|rowwisemoments|welford|"
+             r"reduce_kernel.*(meanops|normtwoops)"),
+    ("gemm", r"gemm|cutlass|sm\d+_.*_tensorop|nvjet|xmma|cublas|ampere_\w*|"
+             r"addmm|baddbmm|matmul|gemv"),
+    ("elementwise", r"elementwise|vectorized|unrolled|gelu|silu|swish|"
+                    r"catarraybatchedcopy|copy_|fill_|mul_|add_|upsample|interpolate"),
     ("softmax", r"softmax"),
     ("reduce", r"reduce|sum_|mean_"),
     ("memory", r"memcpy|memset|transpose|permute|contiguous"),
 ]
 
+#: CPU-side entries the profiler also reports. Their device time is the *sum* of the
+#: kernels they launch, so counting both an `aten::addmm` and the cutlass kernel it
+#: launched double-counts that work -- and since the aten name matches no kernel pattern
+#: it lands in `other`, inflating the uncovered share by exactly the amount it
+#: double-counted. This is why the first FLUX run reported 34% `other` with
+#: `aten::addmm` alone at 22%: that GEMM time was already counted under `gemm`.
+_CPU_SIDE_PREFIXES = ("aten::", "autograd::", "torch::", "cuda", "Optimizer",
+                      "ProfilerStep", "nn.Module", "enumerate(")
+
+
+def is_device_kernel(ev) -> bool:
+    """True for an actual GPU kernel launch, false for a CPU-side operator record."""
+    try:
+        from torch.autograd import DeviceType
+
+        dt = getattr(ev, "device_type", None)
+        if dt is not None:
+            return dt == DeviceType.CUDA
+    except Exception:
+        pass
+    return not str(getattr(ev, "key", "")).startswith(_CPU_SIDE_PREFIXES)
+
 
 def categorise_kernel(name: str) -> str:
-    low = name.lower()
+    # Case-insensitive via the flag rather than by lowering the name, because several
+    # patterns are CamelCase kernel symbols (CatArrayBatchedCopy, RowwiseMoments) and
+    # lowering the haystack while leaving the needle mixed-case meant they never matched.
     for cat, pat in KERNEL_PATTERNS:
-        if re.search(pat, low):
+        if re.search(pat, name, flags=re.IGNORECASE):
             return cat
     return "other"
 
@@ -69,6 +99,8 @@ def profile_pipeline(pipe, *, prompt: str = "a photograph of a city street",
 
     rows = []
     for ev in prof.key_averages():
+        if not is_device_kernel(ev):
+            continue
         cuda_us = float(
             getattr(ev, "self_device_time_total", 0)
             or getattr(ev, "self_cuda_time_total", 0)

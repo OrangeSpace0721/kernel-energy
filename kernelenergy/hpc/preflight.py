@@ -38,6 +38,13 @@ class Check:
         return self.status == "fail"
 
 
+def _safe(fn, default=float('nan')):
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
 def _ok(n, d="") -> Check:
     return Check(n, "ok", d)
 
@@ -171,6 +178,27 @@ def run_preflight(
             checks.append(_warn("hardware.table", detail + "; idle power not measured"))
         else:
             checks.append(_ok("hardware.table", detail))
+
+        # Cross-check the table's TDP against what the card says its limit is. These
+        # should agree on an uncapped card, and a mismatch means one of two things, both
+        # worth knowing: the site has capped the card (fit pi_limit), or the table has
+        # the wrong variant -- e.g. the 250 W A100 40GB PCIe entry used for an 80 GB card
+        # that is really 300 W. The second is silent and uniform: every pi for that GPU
+        # is off by the ratio, which looks like a real efficiency difference.
+        enforced = _safe(lambda: power_limits(dev.nvml_index)["enforced_w"])
+        if enforced == enforced and enforced > 0:
+            ratio = enforced / gpu.tdp_w
+            if abs(ratio - 1.0) > 0.02:
+                checks.append(_warn(
+                    "hardware.tdp_check",
+                    f"card reports a {enforced:.0f} W limit but the table says "
+                    f"{gpu.tdp_w:.0f} W ({ratio:.2f}x). Either the site caps this card "
+                    f"-- fit pi_limit, not pi -- or {gpu.gpu_key}'s tdp_w is the wrong "
+                    f"variant. Every pi on this GPU scales with that denominator.",
+                ))
+            else:
+                checks.append(_ok("hardware.tdp_check",
+                                  f"table TDP agrees with the card ({enforced:.0f} W)"))
     except Exception as e:
         checks.append(_fail("hardware.table", str(e)))
 

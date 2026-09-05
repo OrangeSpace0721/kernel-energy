@@ -70,7 +70,7 @@ for key in "${targets[@]}"; do
     --mem="$KE_MEM"
     --output="$KE_LOGS/ke-$key-%A_%a.out"
     --error="$KE_LOGS/ke-$key-%A_%a.out"
-    --export="ALL,KE_GPU_KEY=$key"
+    --export="ALL,KE_GPU_KEY=$key,KE_SLURM_DIR=$_here"
   )
   # Exclusive buys thermal isolation, not counter correctness -- gres already gives sole
   # use of the GPU. Worth it on small nodes, not worth the queue on 8-GPU ones.

@@ -13,7 +13,22 @@
 #
 #   sbatch --partition=$KE_CPU_PARTITION slurm/03_dataset.sbatch
 
-_here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# SLURM copies the batch script into /var/spool before running it, so BASH_SOURCE
+# points there, not at the repo -- `source "$_here/job_common.sh"` then fails and the
+# job silently runs with whatever environment the submitting shell happened to export.
+# That is why the first capture run worked: the shell had sourced job_common.sh by hand.
+# From a clean shell it would have run with no conda env and no CUDA_DEVICE_ORDER.
+_ke_locate() {
+  local c
+  for c in "${KE_SLURM_DIR:-}" \
+           "${SLURM_SUBMIT_DIR:-}/slurm" \
+           "$(cd "$(dirname "${BASH_SOURCE[1]:-$0}")" 2>/dev/null && pwd)"; do
+    [[ -n "$c" && -f "$c/job_common.sh" ]] && { echo "$c"; return 0; }
+  done
+  echo "cannot locate job_common.sh -- set KE_SLURM_DIR to the repo's slurm/ dir" >&2
+  return 1
+}
+_here="$(_ke_locate)" || exit 1
 # shellcheck source=/dev/null
 source "$_here/job_common.sh"
 

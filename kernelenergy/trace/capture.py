@@ -59,6 +59,28 @@ def _dt(t) -> str:
     return _DTYPE_NAME.get(str(t.dtype), "fp32")
 
 
+def _arg(args: tuple, kwargs: dict, index: int, *names, default=None):
+    """Fetch an argument that may have been passed positionally or by keyword.
+
+    Every wrapper here goes through this, because callers differ and the failure mode is
+    total. diffusers 0.40 calls ``scaled_dot_product_attention(query=..., key=...,
+    value=...)`` where earlier versions passed them positionally -- so a wrapper declared
+    as ``def wrapper(q, k, v, ...)`` raises TypeError on every single call, which the
+    capture loop catches per resolution and reports as "failed at 512x512", producing a
+    catalogue of zero rows. SD3.5 still calls positionally, which is why it captured
+    cleanly in the same run and made the failure look model-specific rather than
+    version-specific.
+
+    Keyword wins over position: a caller that passes something by name means it.
+    """
+    for n in names:
+        if n in kwargs:
+            return kwargs[n]
+    if len(args) > index:
+        return args[index]
+    return default
+
+
 class CaptureContext:
     """Context manager that records every linear, attention, conv and norm call.
 
@@ -115,68 +137,81 @@ class CaptureContext:
     # -- wrappers ----------------------------------------------------------- #
 
     def _wrap_linear(self, orig):
-        def wrapper(x, weight, bias=None):
+        def wrapper(*args, **kwargs):
             try:
+                x = _arg(args, kwargs, 0, "input")
+                w = _arg(args, kwargs, 1, "weight")
+                b = _arg(args, kwargs, 2, "bias")
                 m = 1
                 for d in x.shape[:-1]:
                     m *= int(d)
                 self._record(
                     "gemm", _dt(x),
-                    {"m": m, "n": int(weight.shape[0]), "k": int(weight.shape[1]),
-                     "bias": bias is not None},
+                    {"m": m, "n": int(w.shape[0]), "k": int(w.shape[1]),
+                     "bias": b is not None},
                     "aten::linear",
                 )
             except Exception:
                 pass
-            return orig(x, weight, bias)
+            return orig(*args, **kwargs)
 
         return wrapper
 
     def _wrap_sdpa(self, orig):
-        def wrapper(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, **kw):
+        def wrapper(*args, **kwargs):
             try:
+                q = _arg(args, kwargs, 0, "query")
+                k = _arg(args, kwargs, 1, "key")
+                causal = bool(_arg(args, kwargs, 5, "is_causal", default=False))
                 b, h, s_q, d = (int(x) for x in q.shape)
                 h_kv, s_kv = int(k.shape[1]), int(k.shape[2])
                 self._record(
                     "attention", _dt(q),
                     {"b": b, "h": h, "s_q": s_q, "s_kv": s_kv, "d": d,
-                     "h_kv": h_kv, "causal": bool(is_causal)},
+                     "h_kv": h_kv, "causal": causal},
                     "aten::scaled_dot_product_attention",
                 )
             except Exception:
                 pass
-            return orig(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p,
-                        is_causal=is_causal, **kw)
+            return orig(*args, **kwargs)
 
         return wrapper
 
     def _wrap_conv2d(self, orig):
-        def wrapper(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+        def wrapper(*args, **kwargs):
             try:
-                n, c_in, h, w = (int(d) for d in x.shape)
-                c_out, _, kh, kw = (int(d) for d in weight.shape)
+                x = _arg(args, kwargs, 0, "input")
+                w = _arg(args, kwargs, 1, "weight")
+                bias = _arg(args, kwargs, 2, "bias")
+                stride = _arg(args, kwargs, 3, "stride", default=1)
+                padding = _arg(args, kwargs, 4, "padding", default=0)
+                groups = _arg(args, kwargs, 6, "groups", default=1)
+                n, c_in, h, w_in = (int(d) for d in x.shape)
+                c_out, _, kh, kw = (int(d) for d in w.shape)
                 st = stride[0] if isinstance(stride, (tuple, list)) else stride
                 pd_ = padding[0] if isinstance(padding, (tuple, list)) else padding
-                if isinstance(pd_, str):  # 'same' / 'valid'
+                if isinstance(pd_, str):
                     pd_ = kh // 2 if pd_ == "same" else 0
                 self._record(
                     "conv", _dt(x),
-                    {"n": n, "c_in": c_in, "c_out": c_out, "h": h, "w": w,
+                    {"n": n, "c_in": c_in, "c_out": c_out, "h": h, "w": w_in,
                      "kh": kh, "kw": kw, "stride": int(st), "pad": int(pd_),
                      "groups": int(groups), "bias": bias is not None},
                     "aten::conv2d",
                 )
             except Exception:
                 pass
-            return orig(x, weight, bias, stride, padding, dilation, groups)
+            return orig(*args, **kwargs)
 
         return wrapper
 
     def _wrap_layer_norm(self, orig):
-        def wrapper(x, normalized_shape, weight=None, bias=None, eps=1e-5):
+        def wrapper(*args, **kwargs):
             try:
-                dim = int(normalized_shape[-1]) if hasattr(normalized_shape, "__len__") \
-                    else int(normalized_shape)
+                x = _arg(args, kwargs, 0, "input")
+                shape = _arg(args, kwargs, 1, "normalized_shape")
+                weight = _arg(args, kwargs, 2, "weight")
+                dim = int(shape[-1]) if hasattr(shape, "__len__") else int(shape)
                 rows = 1
                 for d in x.shape[:-1]:
                     rows *= int(d)
@@ -188,13 +223,16 @@ class CaptureContext:
                 )
             except Exception:
                 pass
-            return orig(x, normalized_shape, weight, bias, eps)
+            return orig(*args, **kwargs)
 
         return wrapper
 
     def _wrap_group_norm(self, orig):
-        def wrapper(x, num_groups, weight=None, bias=None, eps=1e-5):
+        def wrapper(*args, **kwargs):
             try:
+                x = _arg(args, kwargs, 0, "input")
+                num_groups = int(_arg(args, kwargs, 1, "num_groups"))
+                weight = _arg(args, kwargs, 2, "weight")
                 n = int(x.shape[0])
                 c = int(x.shape[1])
                 spatial = 1
@@ -203,20 +241,21 @@ class CaptureContext:
                 self._record(
                     "norm", _dt(x),
                     {"rows": n * num_groups, "dim": (c // num_groups) * spatial,
-                     "kind": "group", "groups": int(num_groups),
+                     "kind": "group", "groups": num_groups,
                      "affine": weight is not None},
                     "aten::group_norm",
                 )
             except Exception:
                 pass
-            return orig(x, num_groups, weight, bias, eps)
+            return orig(*args, **kwargs)
 
         return wrapper
 
     def _wrap_act(self, kind: str):
         def factory(orig):
-            def wrapper(x, *a, **kw):
+            def wrapper(*args, **kwargs):
                 try:
+                    x = _arg(args, kwargs, 0, "input")
                     n = 1
                     for d in x.shape:
                         n *= int(d)
@@ -224,7 +263,7 @@ class CaptureContext:
                                  {"n_elem": n, "kind": kind}, f"aten::{kind}")
                 except Exception:
                     pass
-                return orig(x, *a, **kw)
+                return orig(*args, **kwargs)
 
             return wrapper
 

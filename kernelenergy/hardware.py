@@ -246,8 +246,13 @@ GPUS: dict[str, GPU] = {
         smem_size_kb_sm=164.0,
         regfile_kb_sm=256.0,
         mem_tech="HBM",
-        tdp_w=250.0,
-        idle_power_w=38.0,
+        # 300 W, not the 250 W often quoted for "A100 PCIe" -- that figure is the 40 GB
+        # part. The 80 GB PCIe card is 300 W, which is what Iridis's rose nodes report as
+        # their enforced limit. Worth checking against the run-level dataset: `pi` and any
+        # energy target divide by this, so a 250 W denominator on a 300 W card inflates
+        # the power fraction by 20% uniformly for that GPU.
+        tdp_w=300.0,
+        idle_power_w=40.0,
         nvml_patterns=(r"A100.*PCI", r"A100 80GB PCIe"),
     ),
     "A100_SXM4": GPU(
