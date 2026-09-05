@@ -74,10 +74,22 @@ export KE_PRE_ACTIVATE="${KE_PRE_ACTIVATE:-}"   # e.g. "module load conda"
 # its own -- but if both report the same name, one of these two lines is wrong and the
 # rows will be attributed to a single card.
 #
-# Exclusivity: `--gres=gpu:1` already gives sole use of the GPU, and the energy counter
-# is per board, so exclusive is about thermal isolation only. Set on the small nodes
-# where it is cheap; left off on the 8-GPU nodes where it would mean queueing for seven
-# idle cards.
+# Exclusivity: OFF everywhere, deliberately.
+#
+# `--gres=gpu:1` already gives sole use of the GPU, and NVML's energy counter is per
+# board, so a neighbour on another GPU of the same node contributes nothing to your
+# joules. Exclusivity buys only thermal isolation -- a busy chassis runs hotter and can
+# push a card into throttling -- which is second-order and which every row already
+# records via `temperature_mean_c` and `frac_hw_thermal`.
+#
+# That makes it insurance against a problem not yet observed, and expensive insurance:
+# coral01 is the cluster's ONLY L40 node and carries 8 cards; the swarm H100 nodes have 8
+# apiece. Claiming eight GPUs to use one means queueing behind everyone for no measurable
+# gain.
+#
+# Measure first, escalate on evidence. If `frac_hw_thermal` comes back materially
+# non-zero for a card in the quality report, flip that card to "yes" and re-measure just
+# it -- targeted, and only once the data asks for it.
 # gres names confirmed against `sinfo -h -p <part> -o '%G'` on 2026-09-05. Note the
 # swarm partitions use "a100swarm" / "h100swarm", not the "a100sw" / "h100sw" that
 # sinfo's default %10G column shows -- that column truncates, and a truncated gres name
@@ -86,19 +98,20 @@ export KE_PRE_ACTIVATE="${KE_PRE_ACTIVATE:-}"   # e.g. "module load conda"
 # untruncated and flags mismatches.
 declare -gA KE_GPU_SPEC=(
   #                 partition       gres              exclusive
-  [A100_PCIE]="a100|gpu:a100:1|yes"                 # rose[02-13], 2/node, 2d12h
+  [A100_PCIE]="a100|gpu:a100:1|no"                  # rose[02-13], 2/node, 2d12h
   [A100_SXM4]="swarm_a100|gpu:a100swarm:1|no"       # swarma, 4/node, 5d
   [H100]="swarm_h100|gpu:h100swarm:1|no"            # swarmh, 8/node, 5d
   [H200_SXM]="quad_h200|gpu:h200:1|no"              # blossom[01-04], 4/node, 2d12h
   [L4]="l4|gpu:l4:1|no"                             # cotton[01-02], 8/node, 2d12h
-  [L40]="l40|gpu:l40:1|yes"                         # coral01, 8/node, single node
+  [L40]="l40|gpu:l40:1|no"                          # coral01, 8/node, ONLY L40 node
 )
 
 # Scavenger equivalents: same hardware, 12 h limit, preemptible. Much easier to get, and
 # the sweep is built to survive preemption -- it catches the signal, finishes the kernel
-# in flight, flushes and requeues, so an eviction costs one kernel rather than the run.
-# On a cluster where the main GPU partitions queue for days, this is the faster route to
-# a complete dataset, not a compromise.
+# in flight and flushes, so an eviction costs one kernel rather than the run. Iridis
+# disables --requeue, so resuming is a manual `submit_measure.sh <CARD>`; already-measured
+# configs are skipped. On a cluster where the main GPU partitions queue for days, this is
+# still the faster route to a complete dataset, not a compromise.
 #
 # Widen KE_MEASURE_ARRAY when using these so each task holds a node for less time.
 # scavenger_l4 spans two node types (ecsai and swarml), so its gres is left as plain
