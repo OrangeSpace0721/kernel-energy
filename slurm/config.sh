@@ -96,14 +96,26 @@ export KE_PRE_ACTIVATE="${KE_PRE_ACTIVATE:-}"   # e.g. "module load conda"
 # fails as "Requested node configuration is not available", which reads like the
 # partition being full rather than a typo. `identify_gpus.sh --gres` prints them
 # untruncated and flags mismatches.
+# Keys CONFIRMED against the cards' own NVML names on 2026-09-08, from the gpu_key each
+# sweep actually wrote. Two of my earlier guesses were wrong and probe_local_gpu() caught
+# both: the `l40` partition holds L40**S** cards (the gres name is just a label), and
+# `quad_h200` holds H200 **NVL**, not SXM. The rows were correct throughout -- only these
+# labels were off, which showed up as status.sh reporting "no data" for a card that had a
+# complete set.
+#
+# The upshot is that this fleet is exactly the run-level fleet: L4, L40S, A100 PCIe,
+# A100 SXM4, H100, H200 NVL. That makes the kernel-level and run-level datasets directly
+# comparable on the same six cards -- worth more than the extra hardware contrasts an
+# L40 or an H200 SXM would have offered.
 declare -gA KE_GPU_SPEC=(
   #                 partition       gres              exclusive
   [A100_PCIE]="a100|gpu:a100:1|no"                  # rose[02-13], 2/node, 2d12h
   [A100_SXM4]="swarm_a100|gpu:a100swarm:1|no"       # swarma, 4/node, 5d
   [H100]="swarm_h100|gpu:h100swarm:1|no"            # swarmh, 8/node, 5d
-  [H200_SXM]="quad_h200|gpu:h200:1|no"              # blossom[01-04], 4/node, 2d12h
+  [H200_NVL]="quad_h200|gpu:h200:1|no"              # blossom[01-04], 4/node, 2d12h
   [L4]="l4|gpu:l4:1|no"                             # cotton[01-02], 8/node, 2d12h
-  [L40]="l40|gpu:l40:1|no"                          # coral01, 8/node, ONLY L40 node
+  [L40S]="l40|gpu:l40:1|no"                         # coral01, 8/node (gres says l40,
+                                                    # the cards are L40S)
 )
 
 # Scavenger equivalents: same hardware, 12 h limit, preemptible. Much easier to get, and

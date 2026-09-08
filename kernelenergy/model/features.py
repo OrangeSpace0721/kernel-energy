@@ -138,7 +138,10 @@ def analyse(
         f[f"log_bytes_{level}_sm_max"] = _log(b_sm)
         f[f"log_cycles_mem_{level}_gpu"] = _log(t_gpu * clock_hz)
         f[f"log_cycles_mem_{level}_sm_max"] = _log(t_sm * clock_hz)
-        pipe_times[f"mem_{level}"] = t_sm
+        # Both are kept as features, but only the GPU-level one is a valid *floor* --
+        # see the note on floor_pipes below.
+        pipe_times[f"mem_{level}"] = t_gpu
+        pipe_times[f"mem_{level}_sm"] = t_sm
 
     # ---- the roofline floor ------------------------------------------------ #
     # Only the math pipelines and HBM set the floor. L2 and shared-memory times are
@@ -147,6 +150,24 @@ def analyse(
     # are spec-sheet exact. An overstated floor is not a harmless error: efficiency is
     # defined as floor/measured, so a floor above the measured time gives eta > 1, which
     # a sigmoid-bounded head cannot represent and which would quietly cap the model.
+    #
+    # The memory term is the GPU-level one, NOT the worst-SM one, and the asymmetry with
+    # the math pipes is deliberate. A per-SM *math* time is a genuine lower bound: the
+    # busiest SM really must issue that many ops at that pipe's rate, so the kernel
+    # cannot finish sooner. A per-SM *bandwidth* time is not, because bandwidth is a
+    # shared global resource rather than a per-SM allocation -- dividing it by the SM
+    # count assumes every SM is active and drawing an equal slice. A GEMM occupying four
+    # tiles on a 142-SM L40S has the whole 864 GB/s available, not 864/142 = 6.1 GB/s,
+    # and treating it otherwise overstates its time by more than an order of magnitude.
+    #
+    # That error is not uniform across the fleet: it scales with bandwidth-per-SM, so it
+    # is worst exactly on the cards with the least (L4 5.0 GB/s/SM, L40S 6.1) and mild on
+    # the ones with the most (H200 36.4). The first run of this dataset showed the
+    # signature clearly -- eta > 1 on 25-34% of L40S and L4 rows and 0% for the same
+    # categories on H100/H200/A100.
+    #
+    # total_bytes / total_bandwidth is a true floor regardless of occupancy: the kernel
+    # cannot move its bytes faster than the memory system delivers them.
     floor_pipes = {k: v for k, v in pipe_times.items()
                    if k in MATH_PIPES or k == "mem_global"}
     bottleneck = max(floor_pipes, key=lambda k: floor_pipes[k])
