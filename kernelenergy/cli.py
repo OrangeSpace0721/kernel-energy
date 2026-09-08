@@ -261,7 +261,8 @@ def cmd_evaluate(args) -> int:
     tables = {}
     for fold in folds:
         try:
-            tab, results = evaluate(ds, fold=fold, config=cfg)
+            tab, results = evaluate(ds, fold=fold, config=cfg,
+                                per_category=args.per_category)
         except (KeyError, RuntimeError) as e:
             print(f"[{fold}] skipped: {e}")
             continue
@@ -381,6 +382,9 @@ def main(argv=None) -> int:
     c.add_argument("--seed", type=int, default=0)
     c.add_argument("--out", default="")
     c.add_argument("--predictions", default="")
+    c.add_argument("--per-category", action="store_true",
+                   help="fit a separate network per kernel category, as PipeWeave does, "
+                        "rather than one across all of them")
     c.add_argument("--verbose", action="store_true")
     c.set_defaults(func=cmd_evaluate)
 

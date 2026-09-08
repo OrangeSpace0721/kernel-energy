@@ -78,14 +78,34 @@ def _fit_ridge(Xtr, df_tr, Xte, alpha: float = 1.0):
     return np.exp(r.predict((Xte - mu) / sd))
 
 
+def _fit_predict(Xtr, Ytr, Xte, config):
+    model = MLP(Xtr.shape[1], n_heads=2, config=config or TrainConfig())
+    model.fit(Xtr, Ytr)
+    return model.predict(Xte)
+
+
 def evaluate(
     df: pd.DataFrame,
     fold: str = "hardware",
     feature_cols: list[str] | None = None,
     config: TrainConfig | None = None,
     min_group_rows: int = 10,
+    per_category: bool = False,
+    min_category_rows: int = 40,
 ) -> tuple[pd.DataFrame, list[FoldResult]]:
-    """Leave-one-group-out over ``fold``. Returns (table, per-fold results)."""
+    """Leave-one-group-out over ``fold``. Returns (table, per-fold results).
+
+    ``per_category`` fits a separate network for each kernel category rather than one
+    across all of them, which is what PipeWeave actually does -- its GEMM and attention
+    numbers come from independently trained models on separate datasets. Sharing one
+    network across GEMMs, attention, convolutions, norms and elementwise asks it to cover
+    kernels whose bottlenecks, task structure and dynamic range have almost nothing in
+    common, and the categories with the widest spread drag on the rest.
+
+    Categories with fewer than ``min_category_rows`` training rows fall back to a model
+    fitted on everything, since a specialist trained on thirty examples is worse than a
+    generalist trained on fifteen hundred.
+    """
     if fold not in FOLDS:
         raise ValueError(f"fold must be one of {sorted(FOLDS)}, got {fold!r}")
     group_col = FOLDS[fold]
@@ -109,9 +129,24 @@ def evaluate(
         Xtr, Ytr = _prepare(tr, feature_cols)
         Xte, Yte = _prepare(te, feature_cols)
 
-        model = MLP(Xtr.shape[1], n_heads=2, config=config or TrainConfig())
-        model.fit(Xtr, Ytr)
-        pred = model.predict(Xte)
+        if not per_category:
+            pred = _fit_predict(Xtr, Ytr, Xte, config)
+        else:
+            # One specialist per category, with a generalist fallback for thin ones.
+            pred = np.empty((len(te), 2), dtype=float)
+            generalist = None
+            for cat in te["category"].unique():
+                te_mask = (te["category"] == cat).to_numpy()
+                tr_mask = (tr["category"] == cat).to_numpy()
+                if tr_mask.sum() >= min_category_rows:
+                    pred[te_mask] = _fit_predict(
+                        Xtr[tr_mask], Ytr[tr_mask], Xte[te_mask], config
+                    )
+                else:
+                    if generalist is None:
+                        generalist = MLP(Xtr.shape[1], n_heads=2,
+                                         config=config or TrainConfig()).fit(Xtr, Ytr)
+                    pred[te_mask] = generalist.predict(Xte[te_mask])
         eta_hat, pi_hat = pred[:, 0], pred[:, 1]
 
         theory = te["theoretical_time_s"].to_numpy(float)
