@@ -30,19 +30,50 @@ total=0
 n_cat=$(wc -l < "$KE_DATA/catalogue.csv" 2>/dev/null || echo 0)
 [[ $n_cat -gt 0 ]] && n_cat=$((n_cat - 1))
 
-# Rows land in per-(card, category, shard) files, so count uniquely by kernel_sig to
-# avoid double-counting a config a requeued task re-measured.
-for key in $(printf '%s\n' "${!KE_GPU_SPEC[@]}" | sort); do
+# Report on the keys that are ACTUALLY on disk, not only the ones config.sh expects.
+#
+# Those two sets can differ, and the difference is easy to misread as missing data. The
+# file name carries the gpu_key that probe_local_gpu() derived from the card's real NVML
+# product name -- so if the `l40` partition turns out to hold an L40S, the rows land in
+# L40S__*.csv while config.sh still says L40. An earlier version of this script listed
+# only the configured keys and printed "-" beside them, which made a complete, successful
+# sweep look like a job that never ran.
+declare -A _seen=()
+shopt -s nullglob
+for f in "$KE_DATA/raw/"*__*.csv; do
+  _seen["$(basename "$f" | sed 's/__.*//')"]=1
+done
+shopt -u nullglob
+
+# configured keys first, then anything else found on disk
+_order=$( { printf '%s\n' "${!KE_GPU_SPEC[@]}"; printf '%s\n' "${!_seen[@]}"; } | sort -u )
+
+for key in $_order; do
+  configured=""; [[ -n "${KE_GPU_SPEC[$key]:-}" ]] || configured="  <-- not in config.sh"
   files=("$KE_DATA/raw/${key}__"*.csv)
-  [[ -e "${files[0]}" ]] || { printf '  %-12s %s\n' "$key" "-"; continue; }
+  [[ -e "${files[0]}" ]] || { printf '  %-12s %s\n' "$key" "no data yet"; continue; }
   n=$(cat "${files[@]}" 2>/dev/null | grep -v '^kernel_sig' | cut -d, -f1 | sort -u | wc -l)
   total=$((total + n))
   pct=""
   [[ $n_cat -gt 0 ]] && pct=$(awk -v a="$n" -v b="$n_cat" 'BEGIN{printf "%5.1f%%", 100*a/b}')
-  printf '  %-12s %6d rows  %s  (%d shard files)\n' "$key" "$n" "$pct" "${#files[@]}"
+  printf '  %-12s %6d rows  %s  (%d shard files)%s\n' \
+    "$key" "$n" "$pct" "${#files[@]}" "$configured"
 done
 echo "  ---"
 printf '  %-12s %6d rows across the fleet (catalogue has %d configs)\n' "TOTAL" "$total" "$n_cat"
+
+# A key on disk that config.sh does not know about is not an error -- the card simply
+# identified as something other than the label we guessed -- but the label in config.sh
+# should be corrected so resubmissions and status agree.
+for key in "${!_seen[@]}"; do
+  if [[ -z "${KE_GPU_SPEC[$key]:-}" ]]; then
+    echo
+    echo "  NOTE: rows exist for '$key', which is not a key in config.sh. The card"
+    echo "        identified itself differently from the label we assumed. The data is"
+    echo "        fine; rename the KE_GPU_SPEC entry to '$key' so status and resubmits"
+    echo "        line up. Check with:  head -1 \$KE_DATA/raw/${key}__*.csv | head -2"
+  fi
+done
 
 echo
 echo "=== warnings in logs ==="
