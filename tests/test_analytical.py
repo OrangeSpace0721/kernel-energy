@@ -21,7 +21,7 @@ from kernelenergy.kernels import (
     NormKernel,
     make_kernel,
 )
-from kernelenergy.model.features import FEATURE_COLUMNS, analyse
+from kernelenergy.model.features import FEATURE_COLUMNS, MATH_PIPES, analyse
 from kernelenergy.model.schedule import simulate
 
 
@@ -259,9 +259,11 @@ def test_features_are_finite_and_complete(gpu_key, config):
 def test_bottleneck_is_sensible_per_category():
     gpu = get_gpu("A100_PCIE")
     gemm = analyse(make_kernel(cfg("gemm", m=8192, n=8192, k=8192)), gpu)
+    # Large enough that the working set cannot sit in L2 -- otherwise memory imposes no
+    # floor at all and the comparison is meaningless. See the residency tests below.
     norm = analyse(make_kernel(cfg("norm", rows=65536, dim=4096)), gpu)
     assert gemm.bottleneck == "tensor", "a large square GEMM should be tensor-bound"
-    assert norm.bottleneck == "mem_global", "a norm should be bandwidth-bound"
+    assert norm.bottleneck == "mem_compulsory", "a large norm should be bandwidth-bound"
 
 
 def test_theoretical_floor_ignores_estimated_bandwidths():
@@ -270,11 +272,37 @@ def test_theoretical_floor_ignores_estimated_bandwidths():
     If they did, an over-conservative L2 constant would produce eta > 1 and silently cap
     the sigmoid head.
     """
-    from kernelenergy.model.features import MATH_PIPES
-
     gpu = get_gpu("H100")
     res = analyse(make_kernel(cfg("gemm", m=4096, n=3072, k=3072)), gpu)
-    assert res.bottleneck in set(MATH_PIPES) | {"mem_global"}
+    assert res.bottleneck in set(MATH_PIPES) | {"mem_compulsory"}
+
+
+def test_cache_resident_kernel_gets_no_memory_floor():
+    """HBM bandwidth bounds only traffic that reaches HBM.
+
+    An L40S carries 96 MB of L2 and a 4608x3072 bf16 norm moves 57 MB, so in a replay
+    loop it never leaves cache. Charging it HBM bandwidth claimed it took 66 us when it
+    measured under 20 -- eta above 3, on a target a sigmoid head cannot represent. The
+    floor must fall back to the math pipes when the working set fits.
+    """
+    gpu = get_gpu("L40S")
+    small = analyse(make_kernel(cfg("norm", rows=4608, dim=3072)), gpu)
+    assert small.features["fits_in_l2"] == 1.0
+    assert small.features["compulsory_miss_fraction"] == 0.0
+    assert small.bottleneck in set(MATH_PIPES)
+
+
+def test_miss_fraction_rises_with_working_set():
+    """The floor should appear gradually as the working set outgrows the cache."""
+    gpu = get_gpu("L40S")
+    fracs = [
+        analyse(make_kernel(cfg("norm", rows=r, dim=4096)), gpu)
+        .features["compulsory_miss_fraction"]
+        for r in (2048, 16384, 131072, 1048576)
+    ]
+    assert fracs[0] == 0.0
+    assert all(a <= b for a, b in zip(fracs, fracs[1:])), fracs
+    assert fracs[-1] > 0.95, "a working set far above L2 is essentially all compulsory"
 
 
 def test_hopper_gemm_uses_persistent_scheduling():

@@ -143,6 +143,35 @@ def analyse(
         pipe_times[f"mem_{level}"] = t_gpu
         pipe_times[f"mem_{level}_sm"] = t_sm
 
+    # ---- cache residency, and the compulsory-miss floor --------------------- #
+    # HBM bandwidth bounds only the traffic that actually reaches HBM. A kernel whose
+    # working set fits in L2 never goes there -- and in a replay loop it certainly does
+    # not, because the same buffers are touched thousands of times in a row.
+    #
+    # This is not a small correction on this fleet. The L40S carries 96 MB of L2 and a
+    # 4608x3072 bf16 norm moves 57 MB, so the whole thing is resident; charging it
+    # 864 GB/s says it takes 66 us when it measured under 20, and eta sails past 3.
+    # The cards where it bites are exactly the ones with the largest L2 relative to their
+    # HBM bandwidth -- L40S and L4 -- which is the signature the first two dataset builds
+    # showed.
+    #
+    # The honest floor is the *compulsory* traffic: the share of the working set that
+    # cannot fit in cache and must therefore cross the memory bus at least once. Below
+    # capacity that share is zero and memory imposes no bound at all, leaving the math
+    # pipes to set the floor -- conservative by construction, since it can only lower the
+    # floor, never raise it above what was measured.
+    l2_capacity = gpu.l2_cache_mb * 2**20
+    working_set = dist.total("bytes_global")
+    residency = working_set / max(l2_capacity, 1.0)
+    miss_fraction = max(0.0, 1.0 - 1.0 / residency) if residency > 1.0 else 0.0
+
+    f["log_l2_residency"] = _log(residency)
+    f["compulsory_miss_fraction"] = miss_fraction
+    f["fits_in_l2"] = 1.0 if residency <= 1.0 else 0.0
+    pipe_times["mem_compulsory"] = (
+        working_set * miss_fraction / bw["global"] if bw["global"] > 0 else 0.0
+    )
+
     # ---- the roofline floor ------------------------------------------------ #
     # Only the math pipelines and HBM set the floor. L2 and shared-memory times are
     # kept as features and as slack terms but deliberately excluded here, because their
@@ -169,7 +198,7 @@ def analyse(
     # total_bytes / total_bandwidth is a true floor regardless of occupancy: the kernel
     # cannot move its bytes faster than the memory system delivers them.
     floor_pipes = {k: v for k, v in pipe_times.items()
-                   if k in MATH_PIPES or k == "mem_global"}
+                   if k in MATH_PIPES or k == "mem_compulsory"}
     bottleneck = max(floor_pipes, key=lambda k: floor_pipes[k])
     t_theory = max(floor_pipes[bottleneck], _EPS)
     f["log_theoretical_time"] = _log(t_theory)
