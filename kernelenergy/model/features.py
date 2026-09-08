@@ -86,6 +86,7 @@ def analyse(
     clock: str = "tensor",
     scheduler: str | None = None,
     ctas_per_sm: int | None = None,
+    replay_buffers: int = 1,
 ) -> AnalysisResult:
     """Run decompose -> schedule -> features for one kernel on one GPU."""
     tasks = kernel.decompose(gpu)
@@ -160,8 +161,21 @@ def analyse(
     # capacity that share is zero and memory imposes no bound at all, leaving the math
     # pipes to set the floor -- conservative by construction, since it can only lower the
     # floor, never raise it above what was measured.
+    # ``replay_buffers`` is a measurement condition, not a property of the kernel, and it
+    # belongs here because it changes the physics of what was measured. The harness
+    # rotates through n_buffers copies of the inputs precisely so the cache cannot hold
+    # them all -- so the working set the cache sees is n_buffers times one pass, and
+    # comparing a single pass against L2 overstates residency by that factor.
+    #
+    # The measured data says so plainly. Taking bytes/latency as achieved bandwidth for
+    # nominally-resident norm and elementwise kernels gives, at p90: A100 1869 GB/s
+    # against 1935 of HBM, H100 3377 against 3352, H200 3958 against 4800 -- i.e. no
+    # cache benefit whatever, because four copies of their working sets do not fit in
+    # 40-50 MB of L2. The two cards that *do* show a benefit are the L40S (2456, 2.8x its
+    # 864 GB/s of GDDR) and the L4 (887, 3.0x its 300), which are exactly the parts with
+    # a large L2 behind slow off-chip memory.
     l2_capacity = gpu.l2_cache_mb * 2**20
-    working_set = dist.total("bytes_global")
+    working_set = dist.total("bytes_global") * max(int(replay_buffers), 1)
     residency = working_set / max(l2_capacity, 1.0)
     miss_fraction = max(0.0, 1.0 - 1.0 / residency) if residency > 1.0 else 0.0
 

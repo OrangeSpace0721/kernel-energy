@@ -47,7 +47,11 @@ def attach_features(
         try:
             gpu = hardware.get(str(row["gpu_key"]).upper()) or get_gpu(str(row["gpu_key"]))
             cfg = KernelConfig.from_row(row.to_dict())
-            res = analyse(make_kernel(cfg), gpu, clock=clock)
+            # n_buffers is recorded per row: the same kernel measured with more
+            # rotating input copies has a larger effective working set and less cache
+            # residency, and the floor has to reflect the run it is being compared to.
+            res = analyse(make_kernel(cfg), gpu, clock=clock,
+                          replay_buffers=int(row.get("n_buffers", 1) or 1))
             f = dict(res.features)
             f["theoretical_time_s"] = res.theoretical_time_s
             f["bottleneck"] = res.bottleneck
