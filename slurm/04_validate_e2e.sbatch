@@ -39,22 +39,29 @@ source "$_here/job_common.sh"
 MODELS=(flux1-dev sd35-large qwen-image)
 MODEL="${MODELS[${SLURM_ARRAY_TASK_ID:-0}]}"
 
+# Three or more step counts. The sweep is the point: one ratio has several causes at
+# once, while an intercept and a slope separate the once-per-image cost (text encoder,
+# VAE decode) from the per-step transformer cost, and each can be checked against its
+# predicted counterpart. Two points fit a line through no residual and tell you nothing
+# about whether the line is real.
+STEPS="${KE_E2E_STEPS:-4,12,20,28}"
+
 ke_banner
-echo "validating $MODEL on ${KE_GPU_KEY:-?}"
+echo "measuring $MODEL end to end on ${KE_GPU_KEY:-?}, steps $STEPS"
 
 kernelenergy preflight --stage all --models "$MODEL" --device 0 \
   --catalogue "$KE_DATA/catalogue.csv" || exit 1
 
-for steps in 4 20; do
-  echo
-  echo "--- $steps steps ---"
-  python "$_here/../scripts/validate_e2e.py" \
-    --dataset   "$KE_DATA/dataset.csv" \
-    --catalogue "$KE_DATA/catalogue.csv" \
-    --model "$MODEL" \
-    --steps "$steps" \
-    --device 0 \
-    --out "$KE_DATA/e2e_validation.csv"
-done
+kernelenergy e2e \
+  --model "$MODEL" \
+  --steps "$STEPS" \
+  --height "${KE_E2E_HEIGHT:-1024}" \
+  --width  "${KE_E2E_WIDTH:-1024}" \
+  --repeats "${KE_E2E_REPEATS:-3}" \
+  --device 0 \
+  --out "$KE_DATA/e2e"
 
+echo
+echo "reconcile once every card has finished -- it needs no GPU:"
+echo "  kernelenergy reconcile --e2e $KE_DATA/e2e --dataset $KE_DATA/dataset.csv"
 echo "done: $(date -Is)"

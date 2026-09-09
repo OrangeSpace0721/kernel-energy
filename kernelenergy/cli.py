@@ -429,6 +429,134 @@ def cmd_transfer(args) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# end-to-end
+# --------------------------------------------------------------------------- #
+
+
+def cmd_e2e(args) -> int:
+    """Measure real generations. Needs a GPU and the model weights."""
+    import json
+
+    from kernelenergy.e2e.measure import calls_frame, measure_generation
+    from kernelenergy.hardware import probe_local_gpu
+    from kernelenergy.hpc.device import resolve_device
+    from kernelenergy.trace.pipelines import load_pipeline
+
+    dev = resolve_device(args.device, strict=True)
+    gpu = probe_local_gpu(dev.nvml_index)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    steps = [int(x) for x in str(args.steps).split(",") if x]
+    print(f"{gpu.name} ({gpu.gpu_key}); {args.model} at "
+          f"{args.height}x{args.width}, steps {steps}")
+
+    pipe, spec = load_pipeline(args.model, enable_cpu_offload=args.cpu_offload)
+    rows, calls = [], []
+    for n in steps:
+        print(f"\n--- {n} steps ---")
+        m = measure_generation(
+            pipe, spec, model=args.model, gpu_key=gpu.gpu_key, steps=n,
+            height=args.height, width=args.width, device=args.device,
+            repeats=args.repeats, prompt=args.prompt,
+        )
+        print(f"  {m.energy_j:9.2f} J   {m.latency_s:7.3f} s   {m.power_avg_w:6.1f} W"
+              f"   (energy sd {m.energy_sd_rel:.1%})")
+        print(f"  device busy {m.busy_fraction:6.1%} of wall clock"
+              f"   gap {m.gap_s:.3f} s")
+        print(f"  profiler names {m.coverage_fraction:6.1%} of device time as a "
+              f"modelled category")
+        print(f"  {len(m.calls)} configs, {sum(m.calls.values()):,} invocations")
+        rows.append(m.as_row())
+        calls.append(calls_frame(m))
+
+    tag = f"{gpu.gpu_key}__{args.model}"
+    rp = out / f"e2e__{tag}.csv"
+    cp = out / f"e2e_calls__{tag}.csv"
+    pd.DataFrame(rows).to_csv(rp, index=False)
+    pd.concat(calls, ignore_index=True).to_csv(cp, index=False)
+    print(f"\nwrote {rp}\n      {cp}")
+    return 0
+
+
+def cmd_reconcile(args) -> int:
+    """Compare the sum over kernels against the measured generations. No GPU needed."""
+    from kernelenergy.e2e.measure import E2EMeasurement
+    from kernelenergy.e2e.reconcile import reconcile, step_model, summarise
+
+    src = Path(args.e2e)
+    files = sorted(src.glob("e2e__*.csv")) if src.is_dir() else [src]
+    if not files:
+        print(f"no e2e__*.csv under {src}", file=sys.stderr)
+        return 1
+
+    dataset = pd.read_csv(args.dataset)
+    preds = pd.read_csv(args.predictions) if args.predictions else None
+
+    rows = []
+    for f in files:
+        cf = f.parent / f.name.replace("e2e__", "e2e_calls__")
+        if not cf.exists():
+            print(f"  skipping {f.name}: no matching {cf.name}")
+            continue
+        calls_all = pd.read_csv(cf)
+        for _, r in pd.read_csv(f).iterrows():
+            sel = calls_all[(calls_all["steps"] == r["steps"])
+                            & (calls_all["model"] == r["model"])
+                            & (calls_all["gpu_key"] == r["gpu_key"])]
+            m = E2EMeasurement(
+                gpu_key=r["gpu_key"], model=r["model"], steps=int(r["steps"]),
+                height=int(r["height"]), width=int(r["width"]),
+                latency_s=r["latency_s"], energy_j=r["energy_j"],
+                power_avg_w=r["power_avg_w"], latency_sd_rel=r["latency_sd_rel"],
+                energy_sd_rel=r["energy_sd_rel"], n_repeats=int(r["n_repeats"]),
+                energy_counter_used=bool(r["energy_counter_used"]),
+                idle_power_w=r["idle_power_w"],
+                sm_clock_median_mhz=r["sm_clock_median_mhz"],
+                frac_sw_power_cap=r["frac_sw_power_cap"],
+                frac_sw_thermal=r.get("frac_sw_thermal", 0.0),
+                temperature_max_c=r.get("temperature_max_c", 0.0),
+                device_time_s=r["device_time_s"],
+                device_time_covered_s=r["device_time_covered_s"],
+                profiled_latency_s=r["profiled_latency_s"],
+                calls=dict(zip(sel["kernel_sig"], sel["calls"].astype(int))),
+            )
+            try:
+                rows.append(reconcile(m, dataset, preds))
+            except KeyError as e:
+                print(f"  skipping {m.gpu_key}/{m.model}/{m.steps}: {e}")
+
+    if not rows:
+        print("nothing reconciled", file=sys.stderr)
+        return 1
+    df = pd.DataFrame(rows)
+
+    print("\n=== where the wall clock went ===")
+    print("    busy_fraction   share of wall time with a kernel resident")
+    print("    call_coverage   share of invocations the catalogue has a measurement for")
+    print("    profiler_cov    share of device time in a kernel category we model")
+    print(df[["gpu_key", "model", "steps", "e2e_latency_s", "device_time_s", "gap_s",
+              "busy_fraction", "call_coverage", "profiler_coverage"]].round(3).to_string(index=False))
+
+    print("\n=== E_generation = sum(calls x E_kernel) + P_idle x T_gap + residual ===")
+    print("    A = measured replay energies;  B = model predictions")
+    print("    ratio 1.0 is exact; residual_frac is what the identity fails to explain")
+    print(summarise(df).to_string(index=False))
+
+    sm = step_model(df)
+    if len(sm):
+        print("\n=== E(steps) = fixed + per_step x steps ===")
+        print("    fixed  = text encode + VAE decode, once per image")
+        print("    slope  = the denoising transformer, per step")
+        print("    a right slope with a wrong intercept is a VAE problem, and vice versa")
+        print(sm.to_string(index=False))
+
+    if args.out:
+        df.to_csv(args.out, index=False)
+        print(f"\nwrote {args.out}")
+    return 0
+
+
 def cmd_info(args) -> int:
     from kernelenergy.hardware import hardware_frame
     from kernelenergy.model.features import FEATURE_COLUMNS
@@ -574,6 +702,31 @@ def main(argv=None) -> int:
     c.add_argument("--out", default="")
     c.add_argument("--verbose", action="store_true")
     c.set_defaults(func=cmd_transfer)
+
+    c = sub.add_parser("e2e", help="measure real generations end to end (needs a GPU)")
+    c.add_argument("--model", required=True)
+    c.add_argument("--steps", default="4,12,20,28",
+                   help="comma-separated step counts. Three or more lets reconcile "
+                        "separate the once-per-image cost from the per-step cost")
+    c.add_argument("--height", type=int, default=1024)
+    c.add_argument("--width", type=int, default=1024)
+    c.add_argument("--repeats", type=int, default=3)
+    c.add_argument("--device", type=int, default=0)
+    c.add_argument("--cpu-offload", action="store_true")
+    c.add_argument("--prompt", default="a photograph of a city street")
+    c.add_argument("--out", default="data/e2e")
+    c.set_defaults(func=cmd_e2e)
+
+    c = sub.add_parser("reconcile",
+                       help="sum over kernels vs the measured generations (no GPU)")
+    c.add_argument("--e2e", default="data/e2e")
+    c.add_argument("--dataset", default="data/dataset.csv")
+    c.add_argument("--predictions", default="",
+                   help="a predictions CSV from evaluate or transfer, giving level B. "
+                        "Those are leave-one-GPU-out, so the predictions for a card "
+                        "were made by a model that never saw it")
+    c.add_argument("--out", default="data/e2e_reconciliation.csv")
+    c.set_defaults(func=cmd_reconcile)
 
     c = sub.add_parser("info", help="show the hardware table and feature list")
     c.set_defaults(func=cmd_info)
