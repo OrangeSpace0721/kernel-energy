@@ -142,6 +142,20 @@ def evaluate_transfer(
     """
     models_root = Path(models_root)
     cfg = config or TransferConfig()
+
+    # Path first. It is the likeliest thing to be wrong, and a bad one otherwise
+    # surfaces much later as an empty result that looks like a data problem.
+    if not models_root.is_dir():
+        raise FileNotFoundError(
+            f"--models points at {models_root}, which does not exist.\n"
+            f"\n"
+            f"This must be the 'mlp_models' directory of a PipeWeave checkout -- the "
+            f"one holding gemm/, attn/, rmsnorm/ and siluandmul/. Clone it with\n"
+            f"    GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/zksainx/pipeweave\n"
+            f"(the LFS skip matters: gemm_train.csv is a 131 MB object this code does "
+            f"not need)."
+        )
+
     needed = {"eta_pw", "pi", "theory_pw_s", "tdp_w", "energy_j", "pw_operator", "gpu_key"}
     missing = needed - set(df.columns)
     if missing:
@@ -150,6 +164,7 @@ def evaluate_transfer(
     df = df.dropna(subset=["eta_pw", "pi", "theory_pw_s", "energy_j"]).copy()
     results: list[OperatorResult] = []
     skipped: list[str] = []
+    missing_checkpoints: list[str] = []
 
     for op, sub in df.groupby("pw_operator"):
         if operators and op not in operators:
@@ -160,7 +175,7 @@ def evaluate_transfer(
         try:
             ckpt, _ = find_checkpoint(models_root, op)
         except FileNotFoundError as e:
-            skipped.append(f"{op}: {e}")
+            missing_checkpoints.append(f"{op}: {e}")
             continue
 
         for gpu, te in sub.groupby("gpu_key"):
@@ -234,12 +249,32 @@ def evaluate_transfer(
                 predictions=preds,
             ))
 
+    if missing_checkpoints:
+        print(f"evaluate_transfer: no checkpoint for {len(missing_checkpoints)} operator(s)")
+        for s in missing_checkpoints:
+            print(f"  {s}")
     if skipped:
-        print(f"evaluate_transfer: skipped {len(skipped)} (fold, operator) pairs")
+        print(f"evaluate_transfer: skipped {len(skipped)} (fold, operator) pairs "
+              f"for want of rows")
         for s in skipped[:8]:
             print(f"  {s}")
+
     if not results:
-        raise RuntimeError("no (fold, operator) pair had enough rows on both sides")
+        # Distinguish the two ways this ends up empty. They have completely different
+        # fixes, and reporting the wrong one sends you looking at your data when the
+        # actual problem is a path.
+        if missing_checkpoints:
+            raise RuntimeError(
+                f"no operator had a checkpoint under {models_root}. Nothing was "
+                f"evaluated because there was nothing to transfer from -- check the "
+                f"--models path, not the dataset."
+            )
+        raise RuntimeError(
+            f"checkpoints were found, but no (fold, operator) pair had at least "
+            f"{min_rows} training rows and 10 test rows. Either the dataset is too "
+            f"small to hold a GPU out, or emit_frame dropped the rows -- check its "
+            f"failure summary above."
+        )
     return _table(results), results
 
 

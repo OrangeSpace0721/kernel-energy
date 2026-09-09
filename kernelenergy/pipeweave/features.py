@@ -322,9 +322,18 @@ def emit_frame(df, tile_mode: str = "structural", on_error: str = "drop"):
             if on_error == "raise":
                 raise
     if failures:
-        print(f"emit_frame: {len(failures)} rows failed")
-        for i, msg in failures[:5]:
-            print(f"  row {i}: {msg}")
+        # Group by message rather than printing the first five rows. When one thing is
+        # broken -- a missing reference file, an unknown GPU -- every row fails the same
+        # way, and five identical tracebacks hide how many distinct problems there are.
+        from collections import Counter
+
+        counts = Counter(msg for _, msg in failures)
+        print(f"emit_frame: {len(failures)} of {len(df)} rows failed, "
+              f"{len(counts)} distinct cause(s):")
+        for msg, n in counts.most_common(5):
+            print(f"  [{n} rows] {msg}")
+        if len(counts) > 5:
+            print(f"  ... and {len(counts) - 5} more")
     fdf = pd.DataFrame(rows).set_index("__i")
     fdf.index.name = None
     return df.join(fdf, how="left"), blocks

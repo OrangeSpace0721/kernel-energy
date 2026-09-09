@@ -1,0 +1,10 @@
+# The vendored PipeWeave files are checksummed in
+# kernelenergy/pipeweave/vendor/SHA256SUMS, and vendor.verify() fails the test suite
+# if a byte changes. A clone onto a machine with core.autocrlf=true would rewrite them
+# to CRLF on checkout and break that check for no real reason -- so pin them to LF.
+kernelenergy/pipeweave/vendor/** -text
+kernelenergy/pipeweave/vendor/SHA256SUMS -text
+
+# The reference table and test fixtures are gzip; never touch them.
+*.csv.gz binary
+*.gz binary

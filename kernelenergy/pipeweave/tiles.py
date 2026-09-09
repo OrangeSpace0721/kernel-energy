@@ -83,7 +83,22 @@ class GemmLaunch:
 
 @functools.lru_cache(maxsize=1)
 def load_reference(path: str | Path | None = None) -> pd.DataFrame:
-    return pd.read_csv(REFERENCE_PATH if path is None else path)
+    p = REFERENCE_PATH if path is None else Path(path)
+    if not p.exists():
+        raise FileNotFoundError(
+            f"the GEMM tile reference is missing from {p}.\n"
+            f"\n"
+            f"Without it no GEMM or conv kernel can be given a tile shape, so every "
+            f"one of those rows fails and only the norm and elementwise operators "
+            f"survive.\n"
+            f"\n"
+            f"If this repo was cloned, the likely cause is a .gitignore rule: an "
+            f"unanchored 'data/' matches a directory named data at ANY depth, not "
+            f"just the top-level measurement output directory. Check with\n"
+            f"    git check-ignore -v kernelenergy/pipeweave/data/{REFERENCE_PATH.name}\n"
+            f"and anchor the rule to '/data/' if that is what it reports."
+        )
+    return pd.read_csv(p)
 
 
 def _reference_for(gpu_key: str) -> tuple[pd.DataFrame, str]:

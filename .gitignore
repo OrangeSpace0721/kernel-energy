@@ -1,9 +1,11 @@
 # Measurement outputs. These get large fast -- a full fleet sweep is tens of thousands
 # of rows across dozens of shard files, and the HF cache under KE_ROOT is 100+ GB.
-# Nothing under data/ should ever reach the repo.
-data/
-hf/
-logs/
+# Nothing under the top-level data/ should ever reach the repo. The leading slash
+# anchors these to the repo root -- unanchored, 'data/' matches a directory named
+# data at ANY depth, which silently swallowed kernelenergy/pipeweave/data/.
+/data/
+/hf/
+/logs/
 
 # SLURM job output
 *.out
