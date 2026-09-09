@@ -91,6 +91,8 @@ class OperatorResult:
     energy_finetuned: float
     energy_scratch: float
     energy_finetuned_median: float
+    energy_hybrid: float
+    frac_saturated: float
     eta_zeroshot: float
     eta_finetuned: float
     pi_finetuned: float
@@ -224,6 +226,16 @@ def evaluate_transfer(
             p_sc = sc.predict(Xte)
             e_sc = _energy(p_sc[:, 0], p_sc[:, 1], theory, tdp, eta_floor)
 
+            # --- hybrid: transfer where it is speaking, scratch where it is not ----
+            # A saturated efficiency head has stopped carrying information -- the L4
+            # norm case returns a logit of -71.6, i.e. an efficiency of 1e-31, on a
+            # kernel whose features are every one of them inside their training range.
+            # Composing C/eta from that is not a wrong prediction, it is not a
+            # prediction. Where it happens, use the model that was fitted on data
+            # resembling the row.
+            sat = ft.saturated(Xte)
+            e_hy = np.where(sat, e_sc, e_ft)
+
             preds = te[[c for c in ("gpu_key", "category", "source_model", "kernel_sig")
                         if c in te.columns]].copy()
             preds["operator"] = op
@@ -231,6 +243,8 @@ def evaluate_transfer(
             preds["energy_zeroshot"] = e_zs
             preds["energy_finetuned"] = e_ft
             preds["energy_scratch"] = e_sc
+            preds["energy_hybrid"] = e_hy
+            preds["saturated"] = sat
             preds["eta_true"], preds["eta_zeroshot"] = eta_true, eta_zs
             preds["eta_finetuned"] = p_ft[:, 0]
             preds["pi_true"], preds["pi_finetuned"] = pi_true, p_ft[:, 1]
@@ -242,6 +256,8 @@ def evaluate_transfer(
                 energy_finetuned=ft_mean,
                 energy_scratch=_ape(e_true, e_sc)[0],
                 energy_finetuned_median=ft_med,
+                energy_hybrid=_ape(e_true, e_hy)[0],
+                frac_saturated=float(sat.mean()),
                 eta_zeroshot=_ape(eta_true, eta_zs)[1],
                 eta_finetuned=_ape(eta_true, p_ft[:, 0])[1],
                 pi_finetuned=_ape(pi_true, p_ft[:, 1])[1],
@@ -291,7 +307,8 @@ def _table(results: list[OperatorResult]) -> pd.DataFrame:
     rows = [{
         "gpu": r.gpu, "operator": r.operator, "n_test": r.n_test,
         "zeroshot": r.energy_zeroshot, "finetuned": r.energy_finetuned,
-        "scratch": r.energy_scratch, "ft_med": r.energy_finetuned_median,
+        "scratch": r.energy_scratch, "hybrid": r.energy_hybrid,
+        "ft_med": r.energy_finetuned_median, "sat": r.frac_saturated,
         "eta_zs": r.eta_zeroshot, "eta_ft": r.eta_finetuned, "pi_ft": r.pi_finetuned,
         "oob": r.frac_eta_below_train,
     } for r in results]
@@ -303,6 +320,9 @@ def _table(results: list[OperatorResult]) -> pd.DataFrame:
         "zeroshot": _ape(allp["energy_true"], allp["energy_zeroshot"])[0],
         "finetuned": _ape(allp["energy_true"], allp["energy_finetuned"])[0],
         "scratch": _ape(allp["energy_true"], allp["energy_scratch"])[0],
+        "hybrid": _ape(allp["energy_true"], allp["energy_hybrid"])[0],
+        "sat": float(np.average([r.frac_saturated for r in results],
+                                weights=[r.n_test for r in results])),
         "ft_med": _ape(allp["energy_true"], allp["energy_finetuned"])[1],
         "eta_zs": _ape(allp["eta_true"], allp["eta_zeroshot"])[1],
         "eta_ft": _ape(allp["eta_true"], allp["eta_finetuned"])[1],

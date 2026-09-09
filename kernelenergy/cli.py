@@ -331,6 +331,18 @@ def cmd_transfer(args) -> int:
         if float(oob.max()) < 0.01:
             print("  -> every feature inside their training range; not extrapolating")
 
+    print("\n=== joint distance from their training distribution ===")
+    print("    per-feature range checks are blind to this: an L4 LayerNorm can have all")
+    print("    15 features inside their range and still be a kernel they never saw,")
+    print("    because the *ratio* between the pipes is one no training card produced.")
+    try:
+        from kernelenergy.pipeweave.ood import ood_report
+        oo = ood_report(ds)
+        if len(oo):
+            print(oo.head(args.top if args.top else 10).to_string())
+    except FileNotFoundError as e:
+        print(f"    skipped: {e}")
+
     if "theoretical_time_s" in ds:
         print("\n=== their analytical floor vs ours (ratio; 1.0 = identical) ===")
         print(compare_floors(ds).to_string())
@@ -353,6 +365,8 @@ def cmd_transfer(args) -> int:
     print("    zeroshot = their weights untouched, pi = training median")
     print("    finetuned = their trunk + eta head fine-tuned, pi head fitted")
     print("    scratch   = same architecture, random init, same rows")
+    print("    hybrid    = finetuned, falling back to scratch where the efficiency head")
+    print("                saturated (|logit| > 12); sat = fraction of rows that hit")
     print("    ft_med    = median APE of finetuned; oob = frac. of rows below the "
           "training eta range")
     print(tab.to_string())
@@ -366,7 +380,10 @@ def cmd_transfer(args) -> int:
     # broken fine-tune clears easily -- the pretrained weights are still in there
     # underneath -- so reporting "pretraining helped" while fine-tuning is actively
     # damaging the model states two true things that add up to a false impression.
-    best = min(zs, ft)
+    hy = pooled["hybrid"]
+    print(f"    hybrid {hy:.1f}%  (falls back to scratch on {pooled['sat'] * 100:.0f}% "
+          f"of rows where the transferred head saturated)")
+    best = min(zs, ft, hy)
     if ft > zs * 1.05:
         print(f"    FINE-TUNING IS DAMAGING THE MODEL. Their untouched weights with a "
               f"constant pi score {zs:.1f}%; fine-tuning takes that to {ft:.1f}%.")
@@ -384,6 +401,11 @@ def cmd_transfer(args) -> int:
         print(f"    Fine-tuning changed nothing measurable against zero-shot "
               f"({zs:.1f}% vs {ft:.1f}%). The transferred weights are carrying the "
               f"result; the diffusion energy data is not adding to them.")
+
+    if hy < min(zs, ft) * 0.95:
+        print(f"    The hybrid is the best of these. Where the transferred head still "
+              f"speaks it is worth using; where it saturates it is worth ignoring, and "
+              f"the sat column says which rows those are.")
 
     if sc < best * 0.95:
         print(f"    Note: from-scratch ({sc:.1f}%) beats both. The pretrained weights "

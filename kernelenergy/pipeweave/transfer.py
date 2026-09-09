@@ -479,6 +479,27 @@ class TransferModel:
         """Returns ``[eta, pi]`` per row."""
         return self._forward(self._transform(X), training=False)
 
+    def logits(self, X: np.ndarray) -> np.ndarray:
+        """Pre-sigmoid outputs, ``[eta, pi]`` per row.
+
+        The single most useful thing to look at when a transferred prediction is absurd.
+        A sigmoid compresses everything past about -12 into the same visual zero, so a
+        model that is mildly wrong and one that is catastrophically extrapolating are
+        indistinguishable in the output but obvious here: an L4 LayerNorm returns a
+        logit of -71.6 where the same kernel on an A100 returns -4.75.
+        """
+        self._forward(self._transform(X), training=False)
+        return self._z.copy()
+
+    def saturated(self, X: np.ndarray, threshold: float = 12.0) -> np.ndarray:
+        """Boolean per row: is the efficiency head saturated on this input?
+
+        ``sigmoid(-12) = 6e-6``. Past that the head has stopped carrying information and
+        composing ``C / eta`` from it produces an energy off by orders of magnitude, so
+        the row is better served by any model that was fitted on data resembling it.
+        """
+        return np.abs(self.logits(X)[:, 0]) > threshold
+
     def predict_overall_perf(self, X: np.ndarray) -> np.ndarray:
         """Just the efficiency head -- upstream's own output, for comparison."""
         return self.predict(X)[:, 0]

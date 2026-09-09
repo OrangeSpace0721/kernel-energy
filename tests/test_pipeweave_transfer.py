@@ -320,3 +320,80 @@ def test_frozen_batchnorm_keeps_running_statistics():
     original = model.bn[0].run_mean.copy()
     model.fit(X, Y)
     np.testing.assert_allclose(model.bn[0].run_mean, original, rtol=0, atol=0)
+
+
+# --------------------------------------------------------------------------- #
+# Knowing when the checkpoint has nothing to say
+# --------------------------------------------------------------------------- #
+
+
+@needs_upstream
+def test_l4_layernorm_saturates_the_efficiency_head():
+    """The failure that made rmsnorm score 568% and set the pooled headline.
+
+    An L4 LayerNorm at 4096x3072 emits fifteen features that are every one of them
+    inside PipeWeave's per-feature training range -- each about 1% of that feature's
+    maximum, z-scores near -0.25. The checkpoint returns an efficiency of 7.8e-32.
+
+    Marginally in range, jointly impossible. The L4 moves 300 GB/s at 2040 MHz; their
+    most bandwidth-starved training card is the A40 at 696 GB/s and 1740 MHz. For the
+    same kernel the L4's ``global_cycle`` is 9.3x the A100's, where their worst training
+    case reaches 3.4x. No feature is unusual; the arithmetic intensity is.
+
+    This pins the detection, not the failure -- the failure is a property of their
+    training set and cannot be fixed from here.
+    """
+    from kernelenergy.kernels.base import KernelConfig
+    from kernelenergy.pipeweave.features import emit
+
+    path, meta = find_checkpoint(ROOT / "mlp_models", "rmsnorm")
+    model = TransferModel.from_checkpoint(path, "rmsnorm")
+    cfg = KernelConfig(category="norm", dtype="bf16",
+                       params={"rows": 4096, "dim": 3072, "kind": "layer"})
+
+    l4 = emit(cfg, "L4").features[None, :]
+    a100 = emit(cfg, "A100_PCIE").features[None, :]
+
+    # Every L4 feature is inside their range -- this is what made the marginal check
+    # useless, and it must stay true or the test is no longer about what it says.
+    ranges = meta["feature_ranges"]
+    for name, value in zip(PIPEWEAVE_FEATURES["rmsnorm"], l4[0]):
+        r = ranges[name]
+        assert r["min"] <= value <= r["max"], f"{name} left their range; rewrite this test"
+
+    assert model.saturated(l4)[0], "the L4 norm case no longer saturates"
+    assert not model.saturated(a100)[0], "the A100 norm case should be fine"
+    assert model.logits(l4)[0, 0] < -30
+    assert model.logits(a100)[0, 0] > -10
+
+
+def test_mahalanobis_ranks_l4_furthest_from_their_training_data():
+    """The joint check, which sees what the marginal one cannot.
+
+    It is a diagnostic, not a gate: L4 comes out 2.5x further from the training centre
+    than any other card, which is the right signal, but it does not clear rmsnorm's
+    training p99 of 10.17 because their own rmsnorm tail runs to 54. The reliable gate
+    is the saturated logit; this explains *why*.
+    """
+    from kernelenergy.kernels.base import KernelConfig
+    from kernelenergy.pipeweave.features import emit
+    from kernelenergy.pipeweave.ood import mahalanobis
+
+    cfg = KernelConfig(category="norm", dtype="bf16",
+                       params={"rows": 4096, "dim": 3072, "kind": "layer"})
+    d = {k: float(mahalanobis("rmsnorm", emit(cfg, k).features[None, :])[0])
+         for k in ("A100_PCIE", "H100", "L40S", "L4")}
+    assert d["L4"] == max(d.values())
+    assert d["L4"] > 2.0 * max(v for k, v in d.items() if k != "L4")
+
+
+def test_training_moments_cover_every_operator():
+    from kernelenergy.pipeweave.ood import load_moments
+
+    m = load_moments()
+    for op, names in PIPEWEAVE_FEATURES.items():
+        assert op in m, f"no training moments for {op}"
+        assert list(m[op]["features"]) == list(names)
+        assert len(m[op]["mean"]) == len(names)
+        assert np.array(m[op]["precision"]).shape == (len(names), len(names))
+        assert m[op]["md_p50"] < m[op]["md_p99"] < m[op]["md_max"]
