@@ -32,3 +32,4 @@ slurm/config.local.sh
 .idea/
 .DS_Store
 Thumbs.db
+Claude outputs/pipeweave-transfer.tar.gz

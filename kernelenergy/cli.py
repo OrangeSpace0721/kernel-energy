@@ -290,6 +290,97 @@ def cmd_evaluate(args) -> int:
     return 0
 
 
+def cmd_transfer(args) -> int:
+    """Fine-tune PipeWeave's published checkpoints on this project's energy data.
+
+    Prints four tables, and the order matters -- read them top to bottom, because each
+    one decides whether the next is worth believing:
+
+    1. **range** -- how far outside each checkpoint's training data our kernels fall.
+       A model asked to extrapolate cannot be blamed for extrapolating.
+    2. **floors** -- their analytical floor against ours. If these disagree wildly for a
+       category, ``eta`` and ``eta_pw`` are different quantities and nothing that mixes
+       them means anything.
+    3. **transfer** -- zero-shot, fine-tuned and from-scratch energy error per held-out
+       GPU and operator. The comparison the whole exercise exists for.
+    4. **verdict** -- the one-line reading of table 3.
+    """
+    from kernelenergy.pipeweave.evaluate import (
+        compare_floors, evaluate_transfer, prepare, range_report,
+    )
+    from kernelenergy.pipeweave.features import emit_frame
+    from kernelenergy.pipeweave.transfer import TransferConfig
+
+    ds = pd.read_csv(args.dataset)
+    print(f"{len(ds)} rows in")
+
+    feats, blocks = emit_frame(ds, tile_mode=args.tile_mode)
+    print(f"emitted PipeWeave features for {feats['pw_operator'].notna().sum()} rows: "
+          + ", ".join(f"{k} ({len(v)})" for k, v in sorted(blocks.items())))
+    ds = prepare(feats)
+    if args.features_out:
+        ds.to_csv(args.features_out, index=False)
+        print(f"wrote features to {args.features_out}")
+
+    print("\n=== how far outside their training range our kernels sit ===")
+    rr = range_report(ds, args.models)
+    if len(rr):
+        oob = (rr["frac_below_min"] + rr["frac_above_max"]).rename("out_of_range")
+        worst = rr.assign(out_of_range=oob).sort_values("out_of_range", ascending=False)
+        print(worst.head(args.top).to_string())
+        if float(oob.max()) < 0.01:
+            print("  -> every feature inside their training range; not extrapolating")
+
+    if "theoretical_time_s" in ds:
+        print("\n=== their analytical floor vs ours (ratio; 1.0 = identical) ===")
+        print(compare_floors(ds).to_string())
+
+    cfg = TransferConfig(
+        seed=args.seed, max_epochs=args.epochs, warmup_epochs=args.warmup,
+        trunk_lr_scale=args.trunk_lr_scale, freeze_bn=not args.train_bn,
+        energy_weight=args.energy_weight, verbose=args.verbose,
+    )
+    tab, results = evaluate_transfer(ds, args.models, cfg, operators=args.operators or None)
+
+    print("\n=== energy APE (%) by held-out GPU and operator ===")
+    print("    zeroshot = their weights untouched, pi = training median")
+    print("    finetuned = their trunk + eta head fine-tuned, pi head fitted")
+    print("    scratch   = same architecture, random init, same rows")
+    print("    ft_med    = median APE of finetuned; oob = frac. of rows below the "
+          "training eta range")
+    print(tab.to_string())
+
+    pooled = tab.loc[("POOLED", "-")]
+    print("\n=== verdict ===")
+    zs, ft, sc = pooled["zeroshot"], pooled["finetuned"], pooled["scratch"]
+    print(f"    zero-shot {zs:.1f}%   fine-tuned {ft:.1f}%   from scratch {sc:.1f}%")
+    if ft < sc * 0.85:
+        print(f"    Pretraining helped: fine-tuning beats scratch by "
+              f"{(1 - ft / sc) * 100:.0f}%.")
+    elif ft > sc * 1.15:
+        print("    Fine-tuning is WORSE than scratch. Their features or their floor "
+              "are not describing these kernels; check the range table above before "
+              "concluding anything about transfer.")
+    else:
+        print("    Fine-tuning and scratch are within 15% of each other -- their "
+              "pretrained weights are not contributing. The features may be doing all "
+              "the work, which the from-scratch column shares.")
+    if ft > zs:
+        print("    Fine-tuning made zero-shot worse. Lower --trunk-lr-scale, or check "
+              "that BatchNorm is frozen.")
+
+    if args.predictions:
+        out = Path(args.predictions)
+        out.mkdir(parents=True, exist_ok=True)
+        pd.concat([r.predictions for r in results]).to_csv(
+            out / "predictions__transfer.csv", index=False)
+        print(f"\nwrote predictions to {out}")
+    if args.out:
+        Path(args.out).write_text(tab.to_string())
+        print(f"wrote {args.out}")
+    return 0
+
+
 def cmd_info(args) -> int:
     from kernelenergy.hardware import hardware_frame
     from kernelenergy.model.features import FEATURE_COLUMNS
@@ -387,6 +478,41 @@ def main(argv=None) -> int:
                         "rather than one across all of them")
     c.add_argument("--verbose", action="store_true")
     c.set_defaults(func=cmd_evaluate)
+
+    c = sub.add_parser(
+        "transfer",
+        help="fine-tune PipeWeave's released checkpoints on the measured energy data",
+    )
+    c.add_argument("--dataset", default="data/dataset.csv")
+    c.add_argument("--models", required=True,
+                   help="path to a PipeWeave checkout's mlp_models/ directory")
+    c.add_argument("--tile-mode", default="structural",
+                   choices=["structural", "upstream"],
+                   help="structural derives cta_count from the architecture; upstream "
+                        "copies it off the nearest training neighbour, as their "
+                        "aggregator.py does")
+    c.add_argument("--operators", nargs="*", default=[],
+                   choices=["gemm", "attn", "rmsnorm", "siluandmul"])
+    c.add_argument("--epochs", type=int, default=400)
+    c.add_argument("--warmup", type=int, default=150,
+                   help="epochs training the power head alone before the trunk is "
+                        "unfrozen")
+    c.add_argument("--trunk-lr-scale", type=float, default=0.1)
+    c.add_argument("--energy-weight", type=float, default=0.0,
+                   help="weight on the composed log-energy loss; 0 keeps the objective "
+                        "identical to the from-scratch model so the two compare")
+    c.add_argument("--train-bn", action="store_true",
+                   help="let BatchNorm running statistics update. Off by default: a few "
+                        "hundred rows will overwrite statistics fitted on half a million")
+    c.add_argument("--top", type=int, default=12,
+                   help="rows of the out-of-range table to print")
+    c.add_argument("--seed", type=int, default=0)
+    c.add_argument("--features-out", default="",
+                   help="write the dataset with pw_* feature columns here")
+    c.add_argument("--predictions", default="")
+    c.add_argument("--out", default="")
+    c.add_argument("--verbose", action="store_true")
+    c.set_defaults(func=cmd_transfer)
 
     c = sub.add_parser("info", help="show the hardware table and feature list")
     c.set_defaults(func=cmd_info)
