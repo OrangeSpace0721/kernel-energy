@@ -35,3 +35,5 @@ slurm/config.local.sh
 .DS_Store
 Thumbs.db
 Claude outputs/pipeweave-transfer.tar.gz
+Claude outputs/pipeweave-checkpoints.tar.gz
+Claude outputs/ke-fix2.tar.gz

@@ -156,12 +156,40 @@ class TransferConfig:
     max_epochs: int = 400
     lr: float = 3e-4
     trunk_lr_scale: float = 0.1
-    weight_decay: float = 1e-2
+    #: Their training used 1e-4. A pretrained trunk is the last thing that should be
+    #: pulled toward zero every step, so fine-tuning matches them rather than using the
+    #: from-scratch model's 1e-2.
+    weight_decay: float = 1e-4
 
     batch_size: int = 128
     patience: int = 60
     val_fraction: float = 0.15
     seed: int = 0
+
+    #: ``"log"`` (default) or ``"mape"``.
+    #:
+    #: PipeWeave trains with MAPE, and ``"mape"`` reproduces their objective exactly.
+    #: It is the wrong choice for fine-tuning, and dangerously so. MAPE is asymmetric:
+    #: over-predicting costs ``pred/true - 1``, unbounded, while under-predicting costs
+    #: at most 1. When the target is not fully explained by the features -- which is the
+    #: normal condition when transferring to a different kernel population -- the
+    #: loss-minimising move is to push the prediction *below* the conditional median,
+    #: and with eta spanning 1e-6 to 1 it goes most of the way to zero. The symptom is
+    #: an eta APE of almost exactly 100%, because ``|pred - true| / true -> 1`` as
+    #: ``pred -> 0``, and it looks like the model learned nothing when in fact it
+    #: learned to hedge.
+    #:
+    #: It never bit PipeWeave because their features explain their targets at R^2 0.97.
+    #:
+    #: ``"log"`` uses ``|log(pred) - log(true)|``: symmetric in ratio, unbounded in both
+    #: directions, and the natural geometry for a target composed multiplicatively into
+    #: ``E = pi * TDP * C / eta``. It is also better conditioned through a sigmoid head
+    #: -- the ``1/pred`` in its gradient cancels the ``pred(1-pred)`` of the sigmoid
+    #: derivative exactly, leaving ``|dL/dz| <= 1``.
+    loss: str = "log"
+
+    #: Global gradient-norm clip, as in their ``train_mlp.py``. Cheap insurance.
+    grad_clip: float = 1.0
 
     #: Keep BatchNorm in inference mode: running statistics stay as upstream left them.
     freeze_bn: bool = True
@@ -291,6 +319,24 @@ class TransferModel:
 
     # -- parameter groups ----------------------------------------------------- #
 
+    def _clip_gradients(self) -> None:
+        """Global gradient-norm clip, as ``clip_grad_norm_`` in their training script.
+
+        Must run after ``_backward`` and before any optimiser step, and must scale
+        *every* parameter's gradient by the same factor -- clipping each tensor
+        separately would change the descent direction rather than just its length.
+        """
+        c = self.cfg.grad_clip
+        if not c or c <= 0:
+            return
+        grads = [gf() for _, gf, _ in
+                 self._trunk_params() + self._head_params("both")]
+        total = float(np.sqrt(sum(float(np.sum(g * g)) for g in grads)))
+        if total > c and total > 0.0:
+            scale = c / total
+            for g in grads:
+                g *= scale
+
     def _trunk_params(self):
         ps = []
         for dense, bn in zip(self.dense, self.bn):
@@ -318,10 +364,25 @@ class TransferModel:
         """
         w = np.asarray(self.cfg.head_weights, float)
         w = w / w.sum()
-        denom = np.maximum(np.abs(Y), _EPS)
-        resid = Yhat - Y
-        loss = float(np.mean(np.abs(resid) / denom * w))
-        grad = np.sign(resid) / denom * w / Y.shape[0]
+        n = Y.shape[0]
+
+        if self.cfg.loss == "mape":
+            denom = np.maximum(np.abs(Y), _EPS)
+            resid = Yhat - Y
+            loss = float(np.mean(np.abs(resid) / denom * w))
+            grad = np.sign(resid) / denom * w / n
+        elif self.cfg.loss == "log":
+            # Clipping only guards the logarithm; a sigmoid never actually reaches 0
+            # or 1, but it gets close enough to matter in float64.
+            yh = np.clip(Yhat, 1e-9, 1.0 - 1e-12)
+            r = np.log(yh) - np.log(np.maximum(Y, _EPS))
+            loss = float(np.mean(np.abs(r) * w))
+            # d|r|/d yhat = sign(r) / yhat. The 1/yhat is what cancels the sigmoid
+            # derivative downstream, so this stays bounded rather than exploding as
+            # the head saturates.
+            grad = np.sign(r) / yh * w / n
+        else:
+            raise ValueError(f"loss must be 'log' or 'mape', got {self.cfg.loss!r}")
 
         if self.cfg.energy_weight > 0 and energy is not None:
             eta, pi = np.maximum(Yhat[:, 0], _EPS), np.maximum(Yhat[:, 1], _EPS)
@@ -396,6 +457,7 @@ class TransferModel:
                     yhat = self._forward(X[sel], training=True)
                     _, g = self._loss_and_grad(Y[sel], yhat, **slice_extras(sel))
                     self._backward(g)
+                    self._clip_gradients()
                     for o in opts:
                         o.step()
 

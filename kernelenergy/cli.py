@@ -336,9 +336,16 @@ def cmd_transfer(args) -> int:
         print(compare_floors(ds).to_string())
 
     cfg = TransferConfig(
-        seed=args.seed, max_epochs=args.epochs, warmup_epochs=args.warmup,
+        seed=args.seed,
+        # --warmup-only stops after stage 1: the trunk and their efficiency head stay
+        # exactly as released, and only the new power head is fitted. On these kernels
+        # that has so far been the strongest configuration, and it is the one worth
+        # reaching for first when full fine-tuning underperforms zero-shot.
+        max_epochs=0 if args.warmup_only else args.epochs,
+        warmup_epochs=args.warmup,
         trunk_lr_scale=args.trunk_lr_scale, freeze_bn=not args.train_bn,
-        energy_weight=args.energy_weight, verbose=args.verbose,
+        energy_weight=args.energy_weight, loss=args.loss,
+        grad_clip=args.grad_clip, verbose=args.verbose,
     )
     tab, results = evaluate_transfer(ds, args.models, cfg, operators=args.operators or None)
 
@@ -354,20 +361,39 @@ def cmd_transfer(args) -> int:
     print("\n=== verdict ===")
     zs, ft, sc = pooled["zeroshot"], pooled["finetuned"], pooled["scratch"]
     print(f"    zero-shot {zs:.1f}%   fine-tuned {ft:.1f}%   from scratch {sc:.1f}%")
-    if ft < sc * 0.85:
-        print(f"    Pretraining helped: fine-tuning beats scratch by "
-              f"{(1 - ft / sc) * 100:.0f}%.")
-    elif ft > sc * 1.15:
-        print("    Fine-tuning is WORSE than scratch. Their features or their floor "
-              "are not describing these kernels; check the range table above before "
-              "concluding anything about transfer.")
+
+    # Read against zero-shot first. Beating random initialisation is a low bar that a
+    # broken fine-tune clears easily -- the pretrained weights are still in there
+    # underneath -- so reporting "pretraining helped" while fine-tuning is actively
+    # damaging the model states two true things that add up to a false impression.
+    best = min(zs, ft)
+    if ft > zs * 1.05:
+        print(f"    FINE-TUNING IS DAMAGING THE MODEL. Their untouched weights with a "
+              f"constant pi score {zs:.1f}%; fine-tuning takes that to {ft:.1f}%.")
+        print(f"    Best configuration measured here is zero-shot eta with a fitted pi "
+              f"head, which this table does not isolate -- run with "
+              f"--warmup-only to get it.")
+        print(f"    Look for an eta APE near 100% in the table: that is a head "
+              f"collapsing toward zero, not a head that learned nothing. --loss mape "
+              f"causes it (asymmetric penalty on an unfittable target); the default "
+              f"--loss log does not.")
+    elif ft < zs * 0.95:
+        print(f"    Fine-tuning helped: {zs:.1f}% -> {ft:.1f}%, "
+              f"{(1 - ft / zs) * 100:.0f}% better than their weights untouched.")
     else:
-        print("    Fine-tuning and scratch are within 15% of each other -- their "
-              "pretrained weights are not contributing. The features may be doing all "
-              "the work, which the from-scratch column shares.")
-    if ft > zs:
-        print("    Fine-tuning made zero-shot worse. Lower --trunk-lr-scale, or check "
-              "that BatchNorm is frozen.")
+        print(f"    Fine-tuning changed nothing measurable against zero-shot "
+              f"({zs:.1f}% vs {ft:.1f}%). The transferred weights are carrying the "
+              f"result; the diffusion energy data is not adding to them.")
+
+    if sc < best * 0.95:
+        print(f"    Note: from-scratch ({sc:.1f}%) beats both. The pretrained weights "
+              f"are a liability here, not an asset -- check the range table.")
+    elif best < sc * 0.85:
+        print(f"    Pretraining is doing real work: {best:.1f}% against {sc:.1f}% "
+              f"from random initialisation on identical rows.")
+    else:
+        print(f"    Pretraining is not clearly contributing: best transferred "
+              f"{best:.1f}% against {sc:.1f}% from random initialisation.")
 
     if args.predictions:
         out = Path(args.predictions)
@@ -498,6 +524,19 @@ def main(argv=None) -> int:
                    help="epochs training the power head alone before the trunk is "
                         "unfrozen")
     c.add_argument("--trunk-lr-scale", type=float, default=0.1)
+    c.add_argument("--warmup-only", action="store_true",
+                   help="fit ONLY the new power head; leave their trunk and efficiency "
+                        "head exactly as released. The strongest configuration when "
+                        "full fine-tuning scores worse than zero-shot")
+    c.add_argument("--loss", default="log", choices=["log", "mape"],
+                   help="log = |log(pred) - log(true)|, symmetric in ratio. mape "
+                        "reproduces PipeWeave's own objective, but its asymmetry "
+                        "collapses a head toward zero when the target is not fully "
+                        "explained by the features -- which shows up as an eta APE of "
+                        "almost exactly 100%%")
+    c.add_argument("--grad-clip", type=float, default=1.0,
+                   help="global gradient-norm clip, as in their train_mlp.py; 0 to "
+                        "disable")
     c.add_argument("--energy-weight", type=float, default=0.0,
                    help="weight on the composed log-energy loss; 0 keeps the objective "
                         "identical to the from-scratch model so the two compare")

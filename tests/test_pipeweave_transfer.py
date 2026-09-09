@@ -210,6 +210,97 @@ def test_finetuning_moves_pi_without_destroying_eta():
 
 
 @needs_upstream
+def test_mape_collapses_on_an_unfittable_target_and_log_does_not():
+    """The failure that made a real fold score worse than doing nothing.
+
+    MAPE is asymmetric: over-predicting costs ``pred/true - 1``, unbounded; under-
+    predicting costs at most 1. So when the target carries variance the features cannot
+    explain -- the normal condition when transferring to a different kernel population
+    -- the loss is minimised by hedging *downward*, and on a target spanning three
+    orders of magnitude the prediction goes most of the way to zero. It presents as an
+    eta APE of almost exactly 100%, which reads like a head that learned nothing rather
+    than one that learned to hedge.
+
+    It never bit PipeWeave: their features explain their targets at R^2 0.97, so there
+    is nothing to hedge against. It bites immediately on transfer.
+
+    The log loss is symmetric in ratio and has no such fixed point. This test pins the
+    property that matters in practice: **fine-tuning must not end up predicting further
+    from the truth than the untouched checkpoint did.**
+    """
+    path, _ = find_checkpoint(ROOT / "mlp_models", "rmsnorm")
+    df = pd.read_csv(FIXTURES / "pipeweave_rmsnorm.csv.gz")
+    names = list(PIPEWEAVE_FEATURES["rmsnorm"])
+    X = df[names].to_numpy(float)
+
+    rng = np.random.default_rng(0)
+    # Heavy lognormal noise: the features still describe the centre, nothing describes
+    # the spread.
+    eta = np.clip(df["overall_perf"].to_numpy(float)
+                  * np.exp(1.5 * rng.standard_normal(len(df))), 1e-6, 0.999)
+    pi = np.clip(0.45 + 0.02 * rng.standard_normal(len(df)), 0.05, 0.95)
+    Y = np.column_stack([eta, pi])
+    tr = (df["hardware"] != "NVIDIA H200").to_numpy()
+    te = ~tr
+
+    zero_shot = TransferModel.from_checkpoint(path, "rmsnorm").predict(X[te])[:, 0]
+
+    fitted = {}
+    for loss in ("mape", "log"):
+        m = TransferModel.from_checkpoint(
+            path, "rmsnorm", TransferConfig(seed=0, loss=loss))
+        m.fit(X[tr], Y[tr])
+        fitted[loss] = m.predict(X[te])[:, 0]
+
+    # MAPE hedges the prediction downward, away from where the checkpoint had it.
+    assert fitted["mape"].mean() < zero_shot.mean() * 0.75, (
+        "MAPE no longer collapses -- if the loss or the schedule changed such that this "
+        "is genuinely fixed, delete this test rather than loosening it."
+    )
+    # The log loss stays with the checkpoint.
+    assert fitted["log"].mean() > zero_shot.mean() * 0.75, (
+        f"the log loss collapsed too: {fitted['log'].mean():.3e} against a zero-shot "
+        f"{zero_shot.mean():.3e}. Fine-tuning must not move the prediction further from "
+        f"the truth than leaving the checkpoint alone would."
+    )
+
+
+@needs_upstream
+def test_gradient_clipping_bounds_the_update():
+    """Present in their train_mlp.py, absent from the first version of this module."""
+    path, _ = find_checkpoint(ROOT / "mlp_models", "gemm")
+    model = TransferModel.from_checkpoint(
+        path, "gemm", TransferConfig(seed=0, grad_clip=1.0))
+    X = np.log1p(pd.read_csv(FIXTURES / "pipeweave_gemm.csv.gz")
+                 [list(PIPEWEAVE_FEATURES["gemm"])].to_numpy(float)[:64])
+    yhat = model._forward(X, training=True)
+    # A deliberately enormous incoming gradient.
+    model._backward(np.full_like(yhat, 1e6))
+    model._clip_gradients()
+    grads = [gf() for _, gf, _ in model._trunk_params() + model._head_params("both")]
+    total = float(np.sqrt(sum(float(np.sum(g * g)) for g in grads)))
+    assert total <= 1.0 + 1e-6, f"global gradient norm {total:.3f} after clipping to 1.0"
+
+
+@needs_upstream
+def test_warmup_only_leaves_the_efficiency_head_exactly_as_released():
+    """``--warmup-only``: fit the power head, touch nothing they trained."""
+    path, _ = find_checkpoint(ROOT / "mlp_models", "gemm")
+    df = pd.read_csv(FIXTURES / "pipeweave_gemm.csv.gz").sample(n=300, random_state=4)
+    X = df[list(PIPEWEAVE_FEATURES["gemm"])].to_numpy(float)
+    Y = np.column_stack([df["overall_perf"].to_numpy(float), np.full(len(df), 0.4)])
+
+    model = TransferModel.from_checkpoint(
+        path, "gemm", TransferConfig(seed=0, warmup_epochs=30, max_epochs=0))
+    eta_before = model.predict(X)[:, 0]
+    w_before = model.dense[0].w.copy()
+    model.fit(X, Y)
+
+    np.testing.assert_allclose(model.predict(X)[:, 0], eta_before, rtol=1e-9)
+    np.testing.assert_allclose(model.dense[0].w, w_before, rtol=0, atol=0)
+
+
+@needs_upstream
 def test_fit_refuses_to_train_random_weights():
     model = TransferModel(11)
     with pytest.raises(RuntimeError, match="from_checkpoint"):
