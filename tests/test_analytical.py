@@ -499,3 +499,64 @@ def test_peak_reproduces_datasheet_from_tensor_clock():
         assert gpu.peak_tensor_flops("tensor") == pytest.approx(expected)
         if gpu.boost_clock_mhz > gpu.tensor_clock_mhz:
             assert gpu.peak_tensor_flops("boost") > gpu.peak_tensor_flops("tensor")
+
+
+# --------------------------------------------------------------------------- #
+# The floor must be an envelope, not an accumulator
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("gpu_key", ["L40S", "L4", "A100_PCIE", "H100"])
+def test_memory_floor_never_exceeds_streaming_one_pass(gpu_key):
+    """A kernel cannot be *required* to take longer than reading its inputs once.
+
+    The measured latency is per invocation, so the floor may charge for one pass of
+    ``bytes_global`` and no more, whatever the replay harness does around it. The
+    unbounded version of this went unnoticed because it is exactly equal to the correct
+    one when ``n_buffers == 1``, and every synthetic dataset in this repo uses a single
+    buffer -- so it only appeared on real measurements, as eta > 1 on 832 of 1,886 rows.
+
+    ``working_set`` (one pass x n_buffers) is what the *cache* sees and is the right
+    input to a residency calculation. It is not traffic. Charging it as traffic
+    overstated the floor by up to 29x at four buffers, because the miss fraction rises
+    with the rotation as well.
+    """
+    from kernelenergy.hardware import get_gpu
+    from kernelenergy.kernels.base import KernelConfig
+    from kernelenergy.kernels.registry import make_kernel
+    from kernelenergy.model.features import analyse
+
+    gpu = get_gpu(gpu_key)
+    # Big enough that no rotation of it is cache-resident on any card in the fleet.
+    cfg = KernelConfig(category="elementwise", dtype="bf16",
+                       params={"n_elem": 32 * 1024 * 1024, "kind": "add"})
+    kernel = make_kernel(cfg)
+    full_stream = kernel.bytes_global() / (gpu.mem_bandwidth_gbs * 1e9)
+
+    previous = 0.0
+    for n_buffers in (1, 2, 4, 8, 64):
+        res = analyse(kernel, gpu, clock="tensor", replay_buffers=n_buffers)
+        assert res.theoretical_time_s <= full_stream * 1.000001, (
+            f"{gpu_key} at n_buffers={n_buffers}: floor {res.theoretical_time_s:.3e} s "
+            f"exceeds the {full_stream:.3e} s it takes to stream one pass from HBM. "
+            f"The floor is accumulating the buffer rotation instead of bounding one "
+            f"invocation, and eta will exceed 1 by that factor."
+        )
+        # More buffers means less residency, so the floor may rise -- never fall.
+        assert res.theoretical_time_s >= previous - 1e-18
+        previous = res.theoretical_time_s
+
+
+def test_replay_buffers_only_affects_residency_not_traffic():
+    """n_buffers changes what fits in cache. It does not change what one call moves."""
+    from kernelenergy.hardware import get_gpu
+    from kernelenergy.kernels.base import KernelConfig
+    from kernelenergy.kernels.registry import make_kernel
+    from kernelenergy.model.features import analyse
+
+    gpu = get_gpu("L40S")
+    kernel = make_kernel(KernelConfig(category="elementwise", dtype="bf16",
+                                      params={"n_elem": 32 * 1024 * 1024, "kind": "add"}))
+    one, many = (analyse(kernel, gpu, replay_buffers=n) for n in (1, 16))
+    assert one.bytes_global == many.bytes_global
+    assert many.features["compulsory_miss_fraction"] > one.features["compulsory_miss_fraction"]

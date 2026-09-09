@@ -174,8 +174,23 @@ def analyse(
     # 40-50 MB of L2. The two cards that *do* show a benefit are the L40S (2456, 2.8x its
     # 864 GB/s of GDDR) and the L4 (887, 3.0x its 300), which are exactly the parts with
     # a large L2 behind slow off-chip memory.
+    # Two different quantities, and conflating them is a units error that inflates the
+    # floor by the buffer count:
+    #
+    #   one_pass     bytes ONE invocation moves. The measured latency is per
+    #                invocation, so this is the traffic the floor may charge for.
+    #   working_set  bytes the CACHE sees across the whole rotation. Only ever used to
+    #                decide what fraction of one_pass can be resident.
+    #
+    # Charging ``working_set`` for the time says a kernel must move every buffer on
+    # every call. With four buffers past capacity that overstates the floor by ~29x --
+    # miss_fraction rises with the rotation *and* the traffic is multiplied by it -- and
+    # eta, being theory/measured, is overstated by the same factor. It stays invisible
+    # whenever n_buffers is 1, which is why a dataset measured with a single buffer
+    # looked clean.
     l2_capacity = gpu.l2_cache_mb * 2**20
-    working_set = dist.total("bytes_global") * max(int(replay_buffers), 1)
+    one_pass = dist.total("bytes_global")
+    working_set = one_pass * max(int(replay_buffers), 1)
     residency = working_set / max(l2_capacity, 1.0)
     miss_fraction = max(0.0, 1.0 - 1.0 / residency) if residency > 1.0 else 0.0
 
@@ -183,7 +198,7 @@ def analyse(
     f["compulsory_miss_fraction"] = miss_fraction
     f["fits_in_l2"] = 1.0 if residency <= 1.0 else 0.0
     pipe_times["mem_compulsory"] = (
-        working_set * miss_fraction / bw["global"] if bw["global"] > 0 else 0.0
+        one_pass * miss_fraction / bw["global"] if bw["global"] > 0 else 0.0
     )
 
     # ---- the roofline floor ------------------------------------------------ #
