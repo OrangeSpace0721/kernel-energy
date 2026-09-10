@@ -397,3 +397,61 @@ def test_training_moments_cover_every_operator():
         assert len(m[op]["mean"]) == len(names)
         assert np.array(m[op]["precision"]).shape == (len(names), len(names))
         assert m[op]["md_p50"] < m[op]["md_p99"] < m[op]["md_max"]
+
+
+@needs_upstream
+def test_the_warmup_state_is_kept_when_unfreezing_makes_things_worse():
+    """Best-epoch selection spans both stages, and that is load-bearing.
+
+    ``fit`` used to reset the incumbent validation loss when the trunk was unfrozen.
+    Stage 2's first epoch then always beat an infinite incumbent and overwrote the
+    saved weights, so the warmup state could never be recovered -- even when it was
+    strictly better. On real data that showed up as fine-tuning scoring worse than
+    leaving the checkpoint alone, and ``--warmup-only`` had to be added by hand to get
+    back the configuration this loop should have chosen by itself.
+
+    Both stages share a validation split, a loss and a metric, so they are directly
+    comparable and one global best is the correct rule. Given a target the features
+    cannot explain, unfreezing cannot help, and the selected epoch must land in the
+    warmup.
+    """
+    path, _ = find_checkpoint(ROOT / "mlp_models", "rmsnorm")
+    df = pd.read_csv(FIXTURES / "pipeweave_rmsnorm.csv.gz")
+    X = df[list(PIPEWEAVE_FEATURES["rmsnorm"])].to_numpy(float)
+
+    rng = np.random.default_rng(0)
+    eta = np.clip(df["overall_perf"].to_numpy(float)
+                  * np.exp(2.0 * rng.standard_normal(len(df))), 1e-6, 0.999)
+    pi = np.clip(0.45 + 0.02 * rng.standard_normal(len(df)), 0.05, 0.95)
+    tr = (df["hardware"] != "NVIDIA H200").to_numpy()
+
+    warmup = 60
+    m = TransferModel.from_checkpoint(
+        path, "rmsnorm",
+        TransferConfig(warmup_epochs=warmup, max_epochs=200, seed=0))
+    m.fit(X[tr], np.column_stack([eta, pi])[tr])
+
+    assert m.history.stage_starts == [0, warmup]
+    assert m.history.best_epoch < warmup, (
+        f"best epoch {m.history.best_epoch} is in stage 2, but unfreezing the trunk "
+        f"cannot help on a target the features do not explain. The cross-stage best "
+        f"is being reset again."
+    )
+    # And the returned weights really are that epoch's, not the last one's.
+    assert m.history.best_val <= min(m.history.val_loss) + 1e-9
+
+
+@needs_upstream
+def test_best_epoch_is_the_lowest_validation_loss_and_nothing_else():
+    """Not train, not test, not the last epoch."""
+    path, _ = find_checkpoint(ROOT / "mlp_models", "gemm")
+    df = pd.read_csv(FIXTURES / "pipeweave_gemm.csv.gz").sample(n=600, random_state=11)
+    X = df[list(PIPEWEAVE_FEATURES["gemm"])].to_numpy(float)
+    Y = np.column_stack([df["overall_perf"].to_numpy(float), np.full(len(df), 0.4)])
+
+    m = TransferModel.from_checkpoint(
+        path, "gemm", TransferConfig(warmup_epochs=20, max_epochs=60, seed=3))
+    m.fit(X[:500], Y[:500], monitor=(X[500:], Y[500:]))
+    h = m.history
+    assert h.val_loss[h.best_epoch] == pytest.approx(min(h.val_loss), abs=1e-9)
+    assert h.best_val == pytest.approx(min(h.val_loss), abs=1e-9)

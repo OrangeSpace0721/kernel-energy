@@ -437,7 +437,8 @@ class TransferModel:
             return {k: (None if v is None else np.asarray(v, float)[sel])
                     for k, v in extras.items()}
 
-        best, best_epoch, best_state = np.inf, -1, None
+        best, best_state = np.inf, None
+        best_global, seen = -1, 0    # global epoch index of the best, and epochs so far
 
         for stage, (params, lr, epochs) in enumerate([
             (self._head_params("pi"), self.cfg.warmup_lr, self.cfg.warmup_epochs),
@@ -457,7 +458,24 @@ class TransferModel:
                            self.cfg.weight_decay),
                     _AdamW(self._head_params("both"), lr, self.cfg.weight_decay),
                 ]
-                best, best_epoch = np.inf, -1  # early stopping applies to stage 2
+                # The best epoch is tracked ACROSS both stages, deliberately.
+                #
+                # Resetting it here -- which this did -- meant stage 2's first epoch
+                # always beat an infinite incumbent and overwrote the saved weights, so
+                # the model could never fall back to the warmup state even when the
+                # warmup was better. That is not hypothetical: on the real data,
+                # fine-tuning scored worse than leaving the checkpoint alone, and
+                # --warmup-only had to be added by hand to recover the configuration
+                # this loop should have selected on its own.
+                #
+                # The two stages are directly comparable -- same validation split, same
+                # loss, same metric -- so there is no reason to treat stage 2's
+                # incumbent as fresh. With a global best, unfreezing the trunk can no
+                # longer make the returned model worse *on validation* than the warmup
+                # was. It can still make it worse on the held-out card, because
+                # validation is drawn from the training cards; this narrows the failure
+                # rather than removing it.
+                pass
 
             self.history.stage_starts.append(len(self.history.val_loss))
             for epoch in range(epochs):
@@ -485,11 +503,16 @@ class TransferModel:
                     mp = self._forward(self._transform(mx), training=False)
                     self.history.test_loss.append(
                         self._loss_and_grad(np.asarray(my, float), mp)[0])
-                if vloss < best - 1e-9:
-                    best, best_epoch, best_state = vloss, epoch, self._snapshot()
-                    self.history.best_epoch = len(self.history.val_loss) - 1
+                seen = len(self.history.val_loss) - 1
+                # 1e-6, matching MLP. At 1e-9 any float wobble counted as an
+                # improvement and kept resetting the patience counter, so early
+                # stopping effectively never fired.
+                if vloss < best - 1e-6:
+                    best, best_state = vloss, self._snapshot()
+                    best_global = seen
+                    self.history.best_epoch = seen
                     self.history.best_val = vloss
-                elif stage == 1 and epoch - best_epoch >= self.cfg.patience:
+                elif stage == 1 and seen - best_global >= self.cfg.patience:
                     break
                 if self.cfg.verbose and epoch % 25 == 0:
                     print(f"  stage {stage} epoch {epoch:4d}  val {vloss:.5f}")
