@@ -380,6 +380,46 @@ def cmd_transfer(args) -> int:
         print(f"power features -> {args.power_into}: {', '.join(POWER_FEATURES)}")
         print("  new weight columns start at zero, so epoch 0 is identical to the "
               "plain transfer")
+    # --- multi-seed / paired A-B ------------------------------------------------
+    if args.seeds > 1 or args.compare_power:
+        from kernelenergy.pipeweave.seeds import (
+            format_verdict, paired_compare, run_seeds, seed_summary,
+        )
+        import dataclasses
+
+        n = max(args.seeds, 2 if args.compare_power else args.seeds)
+        if args.compare_power:
+            off = dataclasses.replace(cfg, power_features=())
+            on = dataclasses.replace(cfg, power_features=POWER_FEATURES)
+            print(f"\n=== paired A/B over {n} seeds ===")
+            print("    both arms share each seed, so the validation split, the shuffling")
+            print("    and every shared initialisation are held fixed; the difference is")
+            print("    the mechanism.")
+            a = run_seeds(ds, args.models, off, n, args.seed, "no-power")
+            b = run_seeds(ds, args.models, on, n, args.seed, "power")
+            for metric in ("hybrid", "ft_med", "pi_ft"):
+                cells, verdict = paired_compare(a, b, metric, "no-power", "power")
+                print(f"\n--- {metric} ---")
+                print(format_verdict(verdict))
+                sig = cells[cells["seeds"] >= 3].sort_values("delta")
+                print(sig.to_string())
+            if args.out:
+                pd.concat([a, b]).to_csv(args.out, index=False)
+                print(f"\nwrote every run to {args.out}")
+            return 0
+
+        print(f"\n=== {n} seeds ===")
+        runs = run_seeds(ds, args.models, cfg, n, args.seed)
+        summ = seed_summary(runs)
+        print("\n    value is the median across seeds; _pm is half the min-max range.")
+        print("    A cell whose _pm rivals its value is telling you about the seed, "
+              "not the model.")
+        print(summ.to_string())
+        if args.out:
+            runs.to_csv(args.out, index=False)
+            print(f"\nwrote every run to {args.out}")
+        return 0
+
     tab, results = evaluate_transfer(ds, args.models, cfg, operators=args.operators or None)
 
     print("\n=== energy APE (%) by held-out GPU and operator ===")
@@ -728,6 +768,14 @@ def main(argv=None) -> int:
                    help="epochs training the power head alone before the trunk is "
                         "unfrozen")
     c.add_argument("--trunk-lr-scale", type=float, default=0.1)
+    c.add_argument("--seeds", type=int, default=1,
+                   help="repeat the whole evaluation over this many seeds and report "
+                        "the median and spread per cell. Several cells hold under 20 "
+                        "rows, where one seed says very little")
+    c.add_argument("--compare-power", action="store_true",
+                   help="paired A/B of power features off against on, over --seeds "
+                        "seeds sharing each seed between arms. Reports a sign test, "
+                        "which assumes nothing about the error distribution")
     c.add_argument("--power-features", action="store_true",
                    help="give the model per-card power descriptors PipeWeave's features "
                         "lack (idle fraction, W/TFLOP, W per GB/s). New weight columns "
