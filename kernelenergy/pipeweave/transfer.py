@@ -230,7 +230,13 @@ class TransferModel:
         # the warmup from spending its first epochs travelling.
         self.pi_head.b[:] = -1.0
         self.provenance: dict = {}
-        self.history: dict[str, list[float]] = {"train": [], "val": []}
+        from kernelenergy.model.estimator import TrainHistory
+
+        #: Per-epoch losses. ``test_loss`` is a diagnostic and never reaches the
+        #: stopping rule; ``stage_starts`` records the epoch where the warmup ended and
+        #: the trunk was unfrozen, which is exactly where a transfer curve is worth
+        #: looking at.
+        self.history = TrainHistory()
         self._loaded = False
 
     # -- construction from a checkpoint -------------------------------------- #
@@ -396,11 +402,16 @@ class TransferModel:
 
     # -- fit -------------------------------------------------------------------- #
 
-    def fit(self, X, Y, theory=None, tdp=None, energy=None) -> "TransferModel":
+    def fit(self, X, Y, theory=None, tdp=None, energy=None,
+            monitor: tuple = None) -> "TransferModel":
         """Fine-tune on ``Y = [eta, pi]``, both in (0, 1].
 
         ``theory``, ``tdp`` and ``energy`` are only needed when
         ``config.energy_weight > 0``.
+
+        ``monitor`` is an (X, Y) pair -- normally the held-out fold -- whose loss is
+        recorded per epoch and never acted on. Early stopping reads the validation
+        split alone.
         """
         if not self._loaded:
             raise RuntimeError(
@@ -448,24 +459,36 @@ class TransferModel:
                 ]
                 best, best_epoch = np.inf, -1  # early stopping applies to stage 2
 
+            self.history.stage_starts.append(len(self.history.val_loss))
             for epoch in range(epochs):
+                epoch_loss, n_batches = 0.0, 0
                 order = self._rng.permutation(len(tr))
                 for s in range(0, len(order), self.cfg.batch_size):
                     sel = tr[order[s:s + self.cfg.batch_size]]
                     if len(sel) < 2:
                         continue
                     yhat = self._forward(X[sel], training=True)
-                    _, g = self._loss_and_grad(Y[sel], yhat, **slice_extras(sel))
+                    bl, g = self._loss_and_grad(Y[sel], yhat, **slice_extras(sel))
                     self._backward(g)
                     self._clip_gradients()
                     for o in opts:
                         o.step()
+                    epoch_loss += bl
+                    n_batches += 1
 
                 yhat_val = self._forward(X[val], training=False)
                 vloss, _ = self._loss_and_grad(Y[val], yhat_val, **slice_extras(val))
-                self.history["val"].append(vloss)
+                self.history.train_loss.append(epoch_loss / max(n_batches, 1))
+                self.history.val_loss.append(vloss)
+                if monitor is not None:
+                    mx, my = monitor
+                    mp = self._forward(self._transform(mx), training=False)
+                    self.history.test_loss.append(
+                        self._loss_and_grad(np.asarray(my, float), mp)[0])
                 if vloss < best - 1e-9:
                     best, best_epoch, best_state = vloss, epoch, self._snapshot()
+                    self.history.best_epoch = len(self.history.val_loss) - 1
+                    self.history.best_val = vloss
                 elif stage == 1 and epoch - best_epoch >= self.cfg.patience:
                     break
                 if self.cfg.verbose and epoch % 25 == 0:

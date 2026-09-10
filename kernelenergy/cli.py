@@ -259,6 +259,7 @@ def cmd_evaluate(args) -> int:
     cfg = TrainConfig(seed=args.seed, max_epochs=args.epochs, verbose=args.verbose)
 
     tables = {}
+    results_by_fold = {}
     for fold in folds:
         try:
             tab, results = evaluate(ds, fold=fold, config=cfg,
@@ -267,6 +268,7 @@ def cmd_evaluate(args) -> int:
             print(f"[{fold}] skipped: {e}")
             continue
         tables[fold] = tab
+        results_by_fold[fold] = results
         print(f"\n=== {fold} fold: MAPE (%) by held-out group ===")
         print(tab.to_string())
         if args.predictions:
@@ -275,6 +277,17 @@ def cmd_evaluate(args) -> int:
             pd.concat([r.predictions for r in results]).to_csv(
                 out / f"predictions__{fold}.csv", index=False
             )
+
+    if args.curves and results_by_fold:
+        from kernelenergy.model.curves import curves_from_results, render_curves
+
+        sections = curves_from_results(results_by_fold)
+        if sections:
+            path = render_curves(sections, args.curves)
+            n = sum(len(sec["panels"]) for sec in sections)
+            print(f"\nwrote {n} training-curve panels to {path}")
+            print("  train/val come from the training groups; test is the held-out "
+                  "group and never touched early stopping")
 
     if args.out and tables:
         with pd.ExcelWriter(args.out) if str(args.out).endswith(".xlsx") else open(
@@ -416,6 +429,35 @@ def cmd_transfer(args) -> int:
     else:
         print(f"    Pretraining is not clearly contributing: best transferred "
               f"{best:.1f}% against {sc:.1f}% from random initialisation.")
+
+    if args.curves:
+        from kernelenergy.model.curves import render_curves
+
+        # One section per operator: their checkpoints are per-operator, so a shared
+        # axis across operators would be comparing losses on different targets --
+        # rmsnorm eta lives near 0.003 and gemm eta near 0.5.
+        sections = []
+        for op in sorted({r.operator for r in results}):
+            panels = []
+            for r in [x for x in results if x.operator == op]:
+                for name, h in (r.histories or {}).items():
+                    panels.append({
+                        "title": f"{r.gpu} · {name}",
+                        "train": [float(x) for x in h.train_loss],
+                        "val": [float(x) for x in h.val_loss],
+                        "test": [float(x) for x in h.test_loss],
+                        "best_epoch": int(h.best_epoch),
+                        "stage_starts": [int(s) for s in h.stage_starts],
+                        "n_test": int(r.n_test),
+                    })
+            if panels:
+                sections.append({"fold": f"{op} (hardware held out)", "panels": panels})
+        if sections:
+            path = render_curves(sections, args.curves,
+                                 title="Transfer fine-tuning curves by operator")
+            n = sum(len(s["panels"]) for s in sections)
+            print(f"\nwrote {n} training-curve panels to {path}")
+            print("  faint vertical rule = the warmup ended and the trunk was unfrozen")
 
     if args.predictions:
         out = Path(args.predictions)
@@ -652,6 +694,10 @@ def main(argv=None) -> int:
     c.add_argument("--per-category", action="store_true",
                    help="fit a separate network per kernel category, as PipeWeave does, "
                         "rather than one across all of them")
+    c.add_argument("--curves", default="",
+                   help="write per-fold train/validation/test loss curves to this HTML "
+                        "file. The test curve is the held-out group, recorded as a "
+                        "diagnostic and never used for early stopping")
     c.add_argument("--verbose", action="store_true")
     c.set_defaults(func=cmd_evaluate)
 
@@ -696,6 +742,10 @@ def main(argv=None) -> int:
     c.add_argument("--top", type=int, default=12,
                    help="rows of the out-of-range table to print")
     c.add_argument("--seed", type=int, default=0)
+    c.add_argument("--curves", default="",
+                   help="write per-operator fine-tuning loss curves to this HTML file, "
+                        "one panel per (held-out GPU, model). The faint rule marks "
+                        "where the warmup ended and the trunk was unfrozen")
     c.add_argument("--features-out", default="",
                    help="write the dataset with pw_* feature columns here")
     c.add_argument("--predictions", default="")

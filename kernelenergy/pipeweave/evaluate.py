@@ -37,7 +37,7 @@ directly -- ``compare_floors`` does that.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -100,6 +100,9 @@ class OperatorResult:
     #: rows where the model is extrapolating downward into the division's danger zone.
     frac_eta_below_train: float
     predictions: pd.DataFrame
+    #: {"finetuned": TrainHistory, "scratch": TrainHistory}. The test curve is the
+    #: held-out card, recorded as a diagnostic; early stopping reads validation only.
+    histories: dict = field(default_factory=dict)
 
 
 def _energy(eta, pi, theory, tdp, eta_floor=1e-6):
@@ -208,11 +211,14 @@ def evaluate_transfer(
             e_zs = _energy(eta_zs, pi_zs, theory, tdp, eta_floor)
 
             # --- fine-tuned ------------------------------------------------------
+            Yte_m = te[["eta_pw", "pi"]].to_numpy(float)
             ft = TransferModel.from_checkpoint(ckpt, op, cfg)
             ft.fit(Xtr, Ytr,
                    theory=tr["theory_pw_s"].to_numpy(float),
                    tdp=tr["tdp_w"].to_numpy(float),
-                   energy=tr["energy_j"].to_numpy(float))
+                   energy=tr["energy_j"].to_numpy(float),
+                   monitor=(Xte, Yte_m))
+            ft.history.label = f"{gpu}/{op}/finetuned"
             p_ft = ft.predict(Xte)
             e_ft = _energy(p_ft[:, 0], p_ft[:, 1], theory, tdp, eta_floor)
 
@@ -222,7 +228,9 @@ def evaluate_transfer(
             sc.fit(Xtr, Ytr,
                    theory=tr["theory_pw_s"].to_numpy(float),
                    tdp=tr["tdp_w"].to_numpy(float),
-                   energy=tr["energy_j"].to_numpy(float))
+                   energy=tr["energy_j"].to_numpy(float),
+                   monitor=(Xte, Yte_m))
+            sc.history.label = f"{gpu}/{op}/scratch"
             p_sc = sc.predict(Xte)
             e_sc = _energy(p_sc[:, 0], p_sc[:, 1], theory, tdp, eta_floor)
 
@@ -263,6 +271,7 @@ def evaluate_transfer(
                 pi_finetuned=_ape(pi_true, p_ft[:, 1])[1],
                 frac_eta_below_train=float((eta_true < Ytr[:, 0].min()).mean()),
                 predictions=preds,
+                histories={"finetuned": ft.history, "scratch": sc.history},
             ))
 
     if missing_checkpoints:

@@ -54,10 +54,38 @@ class TrainConfig:
 
 @dataclass
 class TrainHistory:
+    """Per-epoch losses.
+
+    ``test_loss`` is a **diagnostic only**. It is the loss on the held-out group, which
+    early stopping must never see -- selecting an epoch on it would leak the held-out
+    card into the model and make the fold meaningless. It is recorded because a curve
+    that shows train falling while test rises is the single most useful picture of what
+    a fold is doing, and it is structurally safe here: ``fit`` takes it as ``monitor``
+    and the stopping rule reads ``val_loss`` alone.
+
+    ``stage_starts`` marks epochs where the optimisation regime changed -- for the
+    transfer model, where the trunk was unfrozen after the warmup.
+    """
+
     train_loss: list[float] = field(default_factory=list)
     val_loss: list[float] = field(default_factory=list)
+    test_loss: list[float] = field(default_factory=list)
     best_epoch: int = -1
     best_val: float = float("inf")
+    stage_starts: list[int] = field(default_factory=list)
+    label: str = ""
+
+    def to_frame(self):
+        import pandas as pd
+
+        n = len(self.train_loss)
+        d = {"epoch": list(range(n)), "train": self.train_loss, "val": self.val_loss}
+        if len(self.test_loss) == n:
+            d["test"] = self.test_loss
+        f = pd.DataFrame(d)
+        f["best_epoch"] = self.best_epoch
+        f["label"] = self.label
+        return f
 
 
 # --------------------------------------------------------------------------- #
@@ -259,7 +287,13 @@ class MLP:
 
     # -- api ----------------------------------------------------------------- #
 
-    def fit(self, X: np.ndarray, Y: np.ndarray, groups: np.ndarray | None = None) -> "MLP":
+    def fit(self, X: np.ndarray, Y: np.ndarray, groups: np.ndarray | None = None,
+            monitor: tuple[np.ndarray, np.ndarray] | None = None) -> "MLP":
+        """``monitor`` is an (X, Y) pair whose loss is recorded and never acted on.
+
+        Pass the held-out fold to get a test curve alongside train and val. It cannot
+        influence the fit: nothing below reads ``history.test_loss``.
+        """
         X = np.asarray(X, float)
         Y = np.asarray(Y, float)
         if Y.ndim == 1:
@@ -316,6 +350,14 @@ class MLP:
             va_loss, _ = self._loss_and_grad(Yva, va_pred)
             self.history.train_loss.append(tr_loss)
             self.history.val_loss.append(va_loss)
+            if monitor is not None:
+                # Diagnostic. Deliberately computed after the stopping decision inputs
+                # and never referenced by them.
+                mx, my = monitor
+                mp = self._forward(self._standardise(np.asarray(mx, float)),
+                                   training=False)
+                self.history.test_loss.append(
+                    self._loss_and_grad(np.asarray(my, float), mp)[0])
 
             if va_loss < best - 1e-6:
                 best, since = va_loss, 0

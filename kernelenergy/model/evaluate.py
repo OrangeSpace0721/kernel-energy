@@ -29,7 +29,7 @@ Three baselines, all of which the model has to beat to be worth its complexity:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -62,6 +62,10 @@ class FoldResult:
     baseline_constant: float
     baseline_ridge: float
     predictions: pd.DataFrame
+    #: Per-epoch train/val/test losses, one entry per fitted network. Keyed by the
+    #: kernel category for a per-category fit, or "all" for the shared one. The test
+    #: curve is the held-out group and is a diagnostic: early stopping never sees it.
+    histories: dict = field(default_factory=dict)
 
 
 def _prepare(df: pd.DataFrame, feature_cols: list[str]):
@@ -78,10 +82,16 @@ def _fit_ridge(Xtr, df_tr, Xte, alpha: float = 1.0):
     return np.exp(r.predict((Xte - mu) / sd))
 
 
-def _fit_predict(Xtr, Ytr, Xte, config):
+def _fit_predict(Xtr, Ytr, Xte, config, Yte=None, label=""):
+    """Fit and predict, returning the training history alongside.
+
+    ``Yte`` is passed as ``monitor`` so the held-out loss is recorded per epoch. It
+    cannot influence the fit -- ``MLP.fit`` reads it only to append to the history.
+    """
     model = MLP(Xtr.shape[1], n_heads=2, config=config or TrainConfig())
-    model.fit(Xtr, Ytr)
-    return model.predict(Xte)
+    model.fit(Xtr, Ytr, monitor=(Xte, Yte) if Yte is not None else None)
+    model.history.label = label
+    return model.predict(Xte), model.history
 
 
 def evaluate(
@@ -129,8 +139,10 @@ def evaluate(
         Xtr, Ytr = _prepare(tr, feature_cols)
         Xte, Yte = _prepare(te, feature_cols)
 
+        histories: dict = {}
         if not per_category:
-            pred = _fit_predict(Xtr, Ytr, Xte, config)
+            pred, hist = _fit_predict(Xtr, Ytr, Xte, config, Yte, f"{group}/all")
+            histories["all"] = hist
         else:
             # One specialist per category, with a generalist fallback for thin ones.
             pred = np.empty((len(te), 2), dtype=float)
@@ -139,8 +151,9 @@ def evaluate(
                 te_mask = (te["category"] == cat).to_numpy()
                 tr_mask = (tr["category"] == cat).to_numpy()
                 if tr_mask.sum() >= min_category_rows:
-                    pred[te_mask] = _fit_predict(
-                        Xtr[tr_mask], Ytr[tr_mask], Xte[te_mask], config
+                    pred[te_mask], histories[str(cat)] = _fit_predict(
+                        Xtr[tr_mask], Ytr[tr_mask], Xte[te_mask], config,
+                        Yte[te_mask], f"{group}/{cat}",
                     )
                 else:
                     if generalist is None:
@@ -193,6 +206,7 @@ def evaluate(
                 baseline_constant=mape(e_true, e_const),
                 baseline_ridge=mape(e_true, e_ridge),
                 predictions=preds,
+                histories=histories,
             )
         )
 
