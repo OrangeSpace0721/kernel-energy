@@ -34,7 +34,26 @@ from dataclasses import dataclass
 from kernelenergy.hardware import GPU, get_gpu
 from kernelenergy.pipeweave.vendor import HardwareSpec
 
-__all__ = ["PW_HARDWARE", "PWHardware", "to_hardware_spec", "gemm_calculator_for"]
+__all__ = ["PW_HARDWARE", "PWHardware", "to_hardware_spec", "gemm_calculator_for",
+           "POWER_FEATURES", "power_matrix"]
+
+#: Per-card power descriptors PipeWeave's features do not carry. Their nineteen
+#: distinct feature names contain no power information at all -- they were predicting
+#: time -- so a transferred power head has nothing to read. These three are the
+#: smallest set that says something a latency feature cannot:
+#:
+#: ``idle_fraction``      P_idle / TDP. A hard lower bound on pi: the card cannot draw
+#:                        less than idle. Ranges 0.091 (L40S) to 0.208 (L4).
+#: ``log_watt_per_tflop`` how many watts this card spends per unit of compute -- what
+#:                        decides the budget share a compute-bound kernel takes.
+#: ``log_watt_per_gbs``   the same for bandwidth, for the memory-bound half.
+#:
+#: They are constant within a card, so they can only help by letting the model
+#: interpolate *across* cards. With five cards that is few degrees of freedom; three
+#: descriptors is already close to the sensible ceiling.
+POWER_FEATURES: tuple[str, ...] = (
+    "idle_fraction", "log_watt_per_tflop", "log_watt_per_gbs",
+)
 
 
 @dataclass(frozen=True)
@@ -218,3 +237,30 @@ def gemm_calculator_for(gpu: GPU | str):
         except Exception:
             raise KeyError(f"no PipeWeave hardware row for {key!r}") from None
     return gemm9_calculator if row.architecture == "hopper" else gemm8_calculator
+
+
+def power_matrix(gpu_keys, names: tuple[str, ...] = POWER_FEATURES) -> "np.ndarray":
+    """``(n_rows, len(names))`` of per-card power descriptors, from the fleet table.
+
+    Taken from :mod:`kernelenergy.hardware` rather than from PipeWeave's rows, because
+    theirs have none -- that absence is the whole reason this exists.
+    """
+    import numpy as np
+
+    from kernelenergy.hardware import get_gpu
+
+    def one(key):
+        g = get_gpu(str(key))
+        vals = {
+            "idle_fraction": g.idle_power_w / g.tdp_w,
+            "log_idle_power": np.log(g.idle_power_w),
+            "log_tdp": np.log(g.tdp_w),
+            "log_watt_per_tflop": np.log(g.tdp_w / (g.peak_tensor_flops("tensor") / 1e12)),
+            "log_watt_per_gbs": np.log(g.tdp_w / g.mem_bandwidth_gbs),
+        }
+        missing = [n for n in names if n not in vals]
+        if missing:
+            raise KeyError(f"unknown power feature(s) {missing}; known: {sorted(vals)}")
+        return [vals[n] for n in names]
+
+    return np.array([one(k) for k in gpu_keys], dtype=float)

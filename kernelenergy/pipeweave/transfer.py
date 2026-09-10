@@ -82,6 +82,10 @@ REFERENCE_CYCLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "attn": ("tensor_all_cycle",),
     "rmsnorm": ("fma_all_cycle", "xu_all_cycle"),
     "siluandmul": ("fma_all_cycle", "xu_all_cycle"),
+    # Same op model as rmsnorm, so the same floor -- but no checkpoint, so nothing is
+    # ever transferred to it. The floor is still wanted: the from-scratch model and the
+    # end-to-end reconciliation both need a theoretical time for these rows.
+    "groupnorm": ("fma_all_cycle", "xu_all_cycle"),
 }
 
 
@@ -191,6 +195,57 @@ class TransferConfig:
     #: Global gradient-norm clip, as in their ``train_mlp.py``. Cheap insurance.
     grad_clip: float = 1.0
 
+    # -- giving the model power information their features do not carry ------- #
+    #
+    # Across all four operators PipeWeave's features have 19 distinct names and not one
+    # carries power: no TDP, no idle draw, no watts per unit of work. They had no reason
+    # to -- they were predicting time. So the pi head is currently being asked to predict
+    # a power fraction from a vector designed for latency, and it only gets away with it
+    # because pi is nearly saturated on this fleet.
+    #
+    # These three options each hand it real power information. They differ in how much of
+    # the transferred model they put at risk.
+
+    #: Per-card power descriptors to append. Empty disables the whole mechanism.
+    #: Computed from the hardware table alone, so they are constant within a card --
+    #: which means they can only help by letting the model interpolate *across* cards,
+    #: and with five cards that is a small number of degrees of freedom. Choose few.
+    power_features: tuple[str, ...] = ()
+
+    #: Where they enter.
+    #:
+    #: ``"pi"`` (default) -- a side channel straight into the power head, concatenated
+    #: to the trunk output. The eta path is left *provably* untouched, because it is a
+    #: different head reading a different vector. Eta is a latency quantity their model
+    #: already predicts well; power descriptors cannot help it and could destabilise it,
+    #: so this spends the risk only where the benefit is.
+    #:
+    #: ``"trunk"`` -- widen the first Linear from (n, 256) to (n + k, 256). More
+    #: expressive: power information reaches every layer and can interact with the
+    #: kernel features. Also lets it perturb eta, which is the failure mode that has
+    #: already bitten this project once.
+    #:
+    #: ``"both"`` -- both.
+    #:
+    #: Whichever is chosen, **the new weight columns are initialised to zero**, so at
+    #: epoch 0 the model is bit-identical to the unmodified transfer. Gradients still
+    #: flow to them (the gradient is input x upstream error, and neither is zero), so
+    #: they earn their way in rather than starting as noise injected into a trunk that
+    #: took 682,892 kernels to fit.
+    power_into: str = "pi"
+
+    #: Reparameterise the power head as ``pi = f + (1 - f) * sigmoid(z)``, where ``f`` is
+    #: the card's idle fraction ``P_idle / TDP``.
+    #:
+    #: This is not a feature -- it is known physics moved into the output layer. A card
+    #: cannot draw less than idle, so pi has a hard floor at ``f``, which ranges from
+    #: 0.091 on the L40S to 0.208 on the L4. A plain sigmoid can predict below that floor
+    #: and wastes capacity learning not to; this cannot, and the head is left predicting
+    #: only the dynamic part -- which is the better-conditioned quantity anyway.
+    #:
+    #: Needs ``idle_fraction`` passed to ``fit``/``predict``.
+    pi_floor_from_idle: bool = False
+
     #: Keep BatchNorm in inference mode: running statistics stay as upstream left them.
     freeze_bn: bool = True
     #: Relative weight of the eta and pi MAPE terms.
@@ -214,17 +269,45 @@ class TransferModel:
     part of the caller's preprocessing.
     """
 
-    def __init__(self, n_features: int, config: TransferConfig | None = None):
+    def __init__(self, n_features: int, config: TransferConfig | None = None,
+                 n_power: int = 0):
         self.cfg = config or TransferConfig()
         self.n_features = n_features
+        self.n_power = int(n_power)
         self._rng = np.random.default_rng(self.cfg.seed)
 
-        dims = (n_features,) + tuple(self.cfg.hidden)
+        into = self.cfg.power_into
+        if self.n_power and into not in ("pi", "trunk", "both"):
+            raise ValueError(f"power_into must be pi|trunk|both, got {into!r}")
+        self._power_trunk = bool(self.n_power) and into in ("trunk", "both")
+        self._power_pi = bool(self.n_power) and into in ("pi", "both")
+
+        dims = (n_features + (self.n_power if self._power_trunk else 0),) \
+            + tuple(self.cfg.hidden)
         self.dense = [_Dense(dims[i], dims[i + 1], self._rng) for i in range(len(dims) - 1)]
         self.bn = [_BatchNorm(d) for d in self.cfg.hidden]
         self.drop = [_Dropout(self.cfg.dropout) for _ in self.cfg.hidden]
-        self.eta_head = _Dense(self.cfg.hidden[-1], 1, self._rng)
-        self.pi_head = _Dense(self.cfg.hidden[-1], 1, self._rng)
+        # Each head draws from its OWN stream, not the shared one. Widening layer 0 for
+        # the power features consumes more of a shared stream, which would shift every
+        # later draw -- so the pi head would start somewhere different for
+        # power_into="trunk" than for "pi", and an A/B between those settings would be
+        # measuring the initialisation as much as the mechanism.
+        self.eta_head = _Dense(self.cfg.hidden[-1], 1,
+                               np.random.default_rng(self.cfg.seed + 1_000))
+        n_pi_extra = self.n_power if self._power_pi else 0
+        self.pi_head = _Dense(self.cfg.hidden[-1] + n_pi_extra, 1,
+                              np.random.default_rng(self.cfg.seed + 2_000))
+        if n_pi_extra:
+            # He init scales by 1/sqrt(fan_in), so widening the head would change the
+            # *existing* columns too and the augmented model would no longer start
+            # where the plain one does. Draw the trunk columns at the unwidened fan-in
+            # and zero-pad, so "with power features" and "without" are the same model
+            # at epoch 0 and the comparison isolates the mechanism.
+            base = _Dense(self.cfg.hidden[-1], 1,
+                          np.random.default_rng(self.cfg.seed + 2_000))
+            self.pi_head.w[: self.cfg.hidden[-1], :] = base.w
+            self.pi_head.w[self.cfg.hidden[-1]:, :] = 0.0
+            self.pi_head.b[:] = base.b
         # A random sigmoid head starts near 0.5. Power fractions cluster well below
         # that, so biasing the head towards a plausible value costs nothing and saves
         # the warmup from spending its first epochs travelling.
@@ -254,7 +337,8 @@ class TransferModel:
                 f"{expected}. These must match exactly -- a checkpoint fed the wrong "
                 f"feature vector produces plausible numbers and no error."
             )
-        model = cls(n_in, config)
+        cfg = config or TransferConfig()
+        model = cls(n_in, cfg, n_power=len(cfg.power_features))
         model.load_state(state)
         model.provenance = {
             "checkpoint": str(path),
@@ -268,7 +352,25 @@ class TransferModel:
         for i, (dense, bn) in enumerate(zip(self.dense, self.bn)):
             li, bi = 4 * i, 4 * i + 2
             # torch Linear stores (out, in); this project stores (in, out).
-            dense.w[:] = state[f"network.{li}.weight"].astype(float).T
+            w = state[f"network.{li}.weight"].astype(float).T
+            if i == 0 and w.shape[0] != dense.w.shape[0]:
+                # Layer 0 was widened for the power features. Their weights occupy the
+                # original columns; the appended ones start at ZERO, so this model's
+                # output is bit-identical to theirs until training moves them.
+                if w.shape[0] != self.n_features:
+                    raise ValueError(
+                        f"checkpoint layer 0 has {w.shape[0]} inputs, expected "
+                        f"{self.n_features} before the {self.n_power} power features"
+                    )
+                dense.w[:] = 0.0
+                dense.w[: self.n_features, :] = w
+                dense.b[:] = state[f"network.{li}.bias"].astype(float)
+                bn.gamma[:] = state[f"network.{bi}.weight"].astype(float)
+                bn.beta[:] = state[f"network.{bi}.bias"].astype(float)
+                bn.run_mean[:] = state[f"network.{bi}.running_mean"].astype(float)
+                bn.run_var[:] = state[f"network.{bi}.running_var"].astype(float)
+                continue
+            dense.w[:] = w
             dense.b[:] = state[f"network.{li}.bias"].astype(float)
             bn.gamma[:] = state[f"network.{bi}.weight"].astype(float)
             bn.beta[:] = state[f"network.{bi}.bias"].astype(float)
@@ -277,6 +379,10 @@ class TransferModel:
         out = 4 * len(self.dense)
         self.eta_head.w[:] = state[f"network.{out}.weight"].astype(float).T
         self.eta_head.b[:] = state[f"network.{out}.bias"].astype(float)
+        if self._power_pi:
+            # The power head is new anyway, but its power columns start at zero too so
+            # the warmup begins from a plain function of the trunk.
+            self.pi_head.w[self.cfg.hidden[-1]:, :] = 0.0
         self._loaded = True
         return self
 
@@ -292,9 +398,16 @@ class TransferModel:
             )
         return np.log1p(X)
 
-    def _forward(self, X: np.ndarray, training: bool) -> np.ndarray:
+    def _forward(self, X: np.ndarray, training: bool, Xp: np.ndarray | None = None,
+                 idle_fraction: np.ndarray | None = None) -> np.ndarray:
         """Their layer order: Linear -> ReLU -> BatchNorm -> Dropout."""
-        h = X
+        if self.n_power and Xp is None:
+            raise ValueError(
+                f"this model was built with {self.n_power} power features; pass them "
+                f"as Xp. Build with power_features=() to disable."
+            )
+        self._Xp = None if Xp is None else np.asarray(Xp, float)
+        h = np.hstack([X, self._Xp]) if self._power_trunk else X
         self._relu_masks = []
         bn_training = training and not self.cfg.freeze_bn
         for dense, bn, dr in zip(self.dense, self.bn, self.drop):
@@ -306,14 +419,38 @@ class TransferModel:
             h = dr.forward(h, training, self._rng)
         self._h = h
         z_eta = self.eta_head.forward(h)
-        z_pi = self.pi_head.forward(h)
+        h_pi = np.hstack([h, self._Xp]) if self._power_pi else h
+        z_pi = self.pi_head.forward(h_pi)
         self._z = np.hstack([z_eta, z_pi])
-        return _sigmoid(self._z)
+        out = _sigmoid(self._z)
+
+        # pi = f + (1 - f) * sigmoid(z): the card cannot draw less than idle, so give
+        # the head that floor rather than making it learn one.
+        if self.cfg.pi_floor_from_idle:
+            if idle_fraction is None:
+                raise ValueError(
+                    "pi_floor_from_idle needs idle_fraction (P_idle / TDP) per row"
+                )
+            f = np.clip(np.asarray(idle_fraction, float).reshape(-1), 0.0, 0.95)
+            self._pi_scale = 1.0 - f
+            out = out.copy()
+            out[:, 1] = f + self._pi_scale * out[:, 1]
+        else:
+            self._pi_scale = None
+        return out
 
     def _backward(self, dyhat: np.ndarray) -> None:
         sig = _sigmoid(self._z)
         dz = dyhat * sig * (1.0 - sig)
-        dh = self.eta_head.backward(dz[:, :1]) + self.pi_head.backward(dz[:, 1:])
+        if self._pi_scale is not None:
+            # d pi / d z = (1 - f) * sigmoid'(z)
+            dz = dz.copy()
+            dz[:, 1] *= self._pi_scale
+        dh = self.eta_head.backward(dz[:, :1])
+        dh_pi = self.pi_head.backward(dz[:, 1:])
+        # The power columns of the pi head read an input, not the trunk: drop their
+        # gradient rather than feeding it back into the last hidden layer.
+        dh = dh + (dh_pi[:, : self.cfg.hidden[-1]] if self._power_pi else dh_pi)
         for dense, bn, dr, mask in zip(
             reversed(self.dense), reversed(self.bn),
             reversed(self.drop), reversed(self._relu_masks),
@@ -322,6 +459,8 @@ class TransferModel:
             dh = bn.backward(dh)
             dh = dh * mask
             dh = dense.backward(dh)
+        # dh now has the widened width if layer 0 took the power features; it is an
+        # input gradient and is discarded either way.
 
     # -- parameter groups ----------------------------------------------------- #
 
@@ -403,7 +542,7 @@ class TransferModel:
     # -- fit -------------------------------------------------------------------- #
 
     def fit(self, X, Y, theory=None, tdp=None, energy=None,
-            monitor: tuple = None) -> "TransferModel":
+            monitor: tuple = None, Xp=None, idle_fraction=None) -> "TransferModel":
         """Fine-tune on ``Y = [eta, pi]``, both in (0, 1].
 
         ``theory``, ``tdp`` and ``energy`` are only needed when
@@ -421,11 +560,36 @@ class TransferModel:
                 "you meant."
             )
         X = self._transform(X)
+        Xp = None if Xp is None else np.asarray(Xp, float)
+        idle = None if idle_fraction is None else np.asarray(idle_fraction, float).reshape(-1)
         Y = np.asarray(Y, float)
         if Y.ndim != 2 or Y.shape[1] != 2:
             raise ValueError(f"expected Y with two columns [eta, pi], got {Y.shape}")
         if np.any(Y <= 0):
             raise ValueError("eta and pi must be strictly positive; MAPE is undefined at 0")
+
+        if self.cfg.pi_floor_from_idle:
+            if idle is None:
+                raise ValueError("pi_floor_from_idle needs idle_fraction per row")
+            below = Y[:, 1] < idle
+            if below.any():
+                raise ValueError(
+                    f"pi_floor_from_idle assumes pi >= P_idle/TDP, but {below.sum()} of "
+                    f"{len(Y)} training rows sit below their card's idle fraction "
+                    f"(worst: pi={Y[below, 1].min():.4f} against a floor of "
+                    f"{idle[below].max():.4f}).\n"
+                    f"\n"
+                    f"That is physically impossible for board power, so one of these is "
+                    f"true and each has a different fix:\n"
+                    f"  - idle_power_w is stale for that card -- re-run "
+                    f"`kernelenergy idle`;\n"
+                    f"  - the energy column has had idle subtracted, making pi a "
+                    f"*dynamic* fraction with no such floor -- use pi_dynamic and leave "
+                    f"this option off;\n"
+                    f"  - the card is power-capped below TDP, so pi is measured against "
+                    f"a denominator it cannot reach -- use pi_limit.\n"
+                    f"Leaving this option off is always safe; it only ever adds a bound."
+                )
 
         n = len(X)
         idx = self._rng.permutation(n)
@@ -436,6 +600,12 @@ class TransferModel:
         def slice_extras(sel):
             return {k: (None if v is None else np.asarray(v, float)[sel])
                     for k, v in extras.items()}
+
+        def pw(sel):
+            return None if Xp is None else Xp[sel]
+
+        def idl(sel):
+            return None if idle is None else idle[sel]
 
         best, best_state = np.inf, None
         best_global, seen = -1, 0    # global epoch index of the best, and epochs so far
@@ -485,7 +655,8 @@ class TransferModel:
                     sel = tr[order[s:s + self.cfg.batch_size]]
                     if len(sel) < 2:
                         continue
-                    yhat = self._forward(X[sel], training=True)
+                    yhat = self._forward(X[sel], training=True, Xp=pw(sel),
+                                         idle_fraction=idl(sel))
                     bl, g = self._loss_and_grad(Y[sel], yhat, **slice_extras(sel))
                     self._backward(g)
                     self._clip_gradients()
@@ -494,13 +665,17 @@ class TransferModel:
                     epoch_loss += bl
                     n_batches += 1
 
-                yhat_val = self._forward(X[val], training=False)
+                yhat_val = self._forward(X[val], training=False, Xp=pw(val),
+                                         idle_fraction=idl(val))
                 vloss, _ = self._loss_and_grad(Y[val], yhat_val, **slice_extras(val))
                 self.history.train_loss.append(epoch_loss / max(n_batches, 1))
                 self.history.val_loss.append(vloss)
                 if monitor is not None:
-                    mx, my = monitor
-                    mp = self._forward(self._transform(mx), training=False)
+                    mx, my, *rest = monitor
+                    mxp = rest[0] if rest else None
+                    midl = rest[1] if len(rest) > 1 else None
+                    mp = self._forward(self._transform(mx), training=False,
+                                       Xp=mxp, idle_fraction=midl)
                     self.history.test_loss.append(
                         self._loss_and_grad(np.asarray(my, float), mp)[0])
                 seen = len(self.history.val_loss) - 1
@@ -521,11 +696,12 @@ class TransferModel:
             self._restore(best_state)
         return self
 
-    def predict(self, X: np.ndarray) -> np.ndarray:
+    def predict(self, X: np.ndarray, Xp=None, idle_fraction=None) -> np.ndarray:
         """Returns ``[eta, pi]`` per row."""
-        return self._forward(self._transform(X), training=False)
+        return self._forward(self._transform(X), training=False, Xp=Xp,
+                             idle_fraction=idle_fraction)
 
-    def logits(self, X: np.ndarray) -> np.ndarray:
+    def logits(self, X: np.ndarray, Xp=None) -> np.ndarray:
         """Pre-sigmoid outputs, ``[eta, pi]`` per row.
 
         The single most useful thing to look at when a transferred prediction is absurd.
@@ -534,17 +710,19 @@ class TransferModel:
         indistinguishable in the output but obvious here: an L4 LayerNorm returns a
         logit of -71.6 where the same kernel on an A100 returns -4.75.
         """
-        self._forward(self._transform(X), training=False)
+        self._forward(self._transform(X), training=False, Xp=Xp,
+                      idle_fraction=np.zeros(len(np.atleast_2d(X)))
+                      if self.cfg.pi_floor_from_idle else None)
         return self._z.copy()
 
-    def saturated(self, X: np.ndarray, threshold: float = 12.0) -> np.ndarray:
+    def saturated(self, X: np.ndarray, threshold: float = 12.0, Xp=None) -> np.ndarray:
         """Boolean per row: is the efficiency head saturated on this input?
 
         ``sigmoid(-12) = 6e-6``. Past that the head has stopped carrying information and
         composing ``C / eta`` from it produces an energy off by orders of magnitude, so
         the row is better served by any model that was fitted on data resembling it.
         """
-        return np.abs(self.logits(X)[:, 0]) > threshold
+        return np.abs(self.logits(X, Xp=Xp)[:, 0]) > threshold
 
     def predict_overall_perf(self, X: np.ndarray) -> np.ndarray:
         """Just the efficiency head -- upstream's own output, for comparison."""

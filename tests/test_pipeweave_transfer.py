@@ -388,10 +388,20 @@ def test_mahalanobis_ranks_l4_furthest_from_their_training_data():
 
 
 def test_training_moments_cover_every_operator():
+    """Every operator PipeWeave trained is covered.
+
+    ``groupnorm`` is deliberately absent: it is our label for a kernel they have no
+    checkpoint or training data for, scored against the RMSNorm distribution precisely
+    to show it does not belong there.
+    """
+    from kernelenergy.pipeweave.features import NO_CHECKPOINT
     from kernelenergy.pipeweave.ood import load_moments
 
     m = load_moments()
     for op, names in PIPEWEAVE_FEATURES.items():
+        if op in NO_CHECKPOINT:
+            assert op not in m, f"{op} has no upstream training data; it must not have moments"
+            continue
         assert op in m, f"no training moments for {op}"
         assert list(m[op]["features"]) == list(names)
         assert len(m[op]["mean"]) == len(names)
@@ -455,3 +465,137 @@ def test_best_epoch_is_the_lowest_validation_loss_and_nothing_else():
     h = m.history
     assert h.val_loss[h.best_epoch] == pytest.approx(min(h.val_loss), abs=1e-9)
     assert h.best_val == pytest.approx(min(h.val_loss), abs=1e-9)
+
+
+@needs_upstream
+def test_groupnorm_is_split_out_and_never_transferred_to():
+    """The largest distribution error found in this transfer, pinned.
+
+    ``norm`` was one category covering two different operators. Transformer LayerNorm
+    sits comfortably inside PipeWeave's RMSNorm distribution; a VAE GroupNorm does not,
+    because their ``dim`` is a transformer hidden size (128 to 16,384) and a GroupNorm
+    row is a whole group of feature maps -- 262,144 elements at 128x128x512, 4,194,304 at
+    1024x1024x128.
+
+    The distance is card-independent -- 22.0 on A100, 23.1 on L4 -- which is why this hit
+    all five cards at roughly half their norm rows, and why attributing it to the L4
+    was wrong.
+    """
+    from kernelenergy.kernels.base import KernelConfig
+    from kernelenergy.pipeweave.features import NO_CHECKPOINT, emit
+    from kernelenergy.pipeweave.ood import load_moments, mahalanobis
+
+    p99 = load_moments()["rmsnorm"]["md_p99"]
+
+    layer = emit(KernelConfig(category="norm", dtype="bf16",
+                              params={"rows": 4096, "dim": 3072, "kind": "layer"}), "A100_PCIE")
+    group = emit(KernelConfig(category="norm", dtype="bf16",
+                              params={"rows": 32, "dim": 262144, "kind": "group",
+                                      "groups": 32}), "A100_PCIE")
+
+    assert layer.operator == "rmsnorm"
+    assert group.operator == "groupnorm"
+    assert group.operator in NO_CHECKPOINT
+    assert any("no PipeWeave counterpart" in n for n in group.notes)
+
+    d_layer = float(mahalanobis("rmsnorm", layer.features[None, :])[0])
+    d_group = float(mahalanobis("groupnorm", group.features[None, :])[0])
+    assert d_layer < p99, f"LayerNorm should be in distribution, got {d_layer:.1f}"
+    assert d_group > 2 * p99, f"GroupNorm should be far out, got {d_group:.1f}"
+
+    # Card-independent: this is an operator mismatch, not hardware extrapolation.
+    d_l4 = float(mahalanobis("groupnorm", emit(
+        KernelConfig(category="norm", dtype="bf16",
+                     params={"rows": 32, "dim": 262144, "kind": "group", "groups": 32}),
+        "L4").features[None, :])[0])
+    assert abs(d_group - d_l4) < 0.15 * d_group
+
+
+# --------------------------------------------------------------------------- #
+# Giving the model power information their features lack
+# --------------------------------------------------------------------------- #
+
+
+@needs_upstream
+@pytest.mark.parametrize("into", ["pi", "trunk", "both"])
+def test_zero_init_means_epoch_zero_is_the_untouched_transfer(into):
+    """The property that makes adding inputs to a pretrained model safe.
+
+    New weight columns start at zero, so before any training the model's output is
+    bit-identical to the plain transfer -- not close, identical. Power information can
+    then only be *learned into* the model; it is never noise injected at initialisation
+    into a trunk that took 682,892 kernels to fit.
+    """
+    path, _ = find_checkpoint(ROOT / "mlp_models", "gemm")
+    df = pd.read_csv(FIXTURES / "pipeweave_gemm.csv.gz").sample(n=250, random_state=0)
+    X = df[list(PIPEWEAVE_FEATURES["gemm"])].to_numpy(float)
+    Xp = np.tile([0.133, -0.73, -1.86], (len(df), 1))
+
+    base = TransferModel.from_checkpoint(path, "gemm").predict(X)
+    cfg = TransferConfig(power_features=("a", "b", "c"), power_into=into)
+    aug = TransferModel.from_checkpoint(path, "gemm", cfg).predict(X, Xp=Xp)
+
+    np.testing.assert_array_equal(aug[:, 0], base[:, 0])
+    np.testing.assert_array_equal(aug[:, 1], base[:, 1])
+
+
+@needs_upstream
+def test_power_columns_actually_learn():
+    """Zero-init is only useful if gradients reach the new columns."""
+    path, _ = find_checkpoint(ROOT / "mlp_models", "gemm")
+    df = pd.read_csv(FIXTURES / "pipeweave_gemm.csv.gz").sample(n=300, random_state=2)
+    X = df[list(PIPEWEAVE_FEATURES["gemm"])].to_numpy(float)
+    rng = np.random.default_rng(0)
+    # Two cards with different power character, and a pi that depends on which.
+    which = rng.integers(0, 2, len(df))
+    Xp = np.where(which[:, None] == 0, [0.208, -1.21, -1.43], [0.091, -0.73, -0.90])
+    Y = np.column_stack([df["overall_perf"].to_numpy(float),
+                         np.where(which == 0, 0.30, 0.70)])
+
+    cfg = TransferConfig(power_features=("a", "b", "c"), power_into="pi",
+                         warmup_epochs=60, max_epochs=60, seed=0)
+    m = TransferModel.from_checkpoint(path, "gemm", cfg)
+    before = m.pi_head.w[len(cfg.hidden) and cfg.hidden[-1]:, :].copy()
+    assert np.all(before == 0.0)
+    m.fit(X, Y, Xp=Xp)
+    after = m.pi_head.w[cfg.hidden[-1]:, :]
+    assert np.abs(after).max() > 1e-4, "power columns never moved off zero"
+
+
+@needs_upstream
+def test_pi_floor_is_respected_and_violations_are_refused():
+    """``pi = f + (1-f)*sigmoid(z)`` cannot predict below the card's idle draw.
+
+    And if the *training* data violates that bound, the option refuses rather than
+    fitting something physically impossible -- because a pi below idle means the energy
+    column, the idle measurement or the TDP denominator is wrong, and each has a
+    different fix.
+    """
+    path, _ = find_checkpoint(ROOT / "mlp_models", "gemm")
+    df = pd.read_csv(FIXTURES / "pipeweave_gemm.csv.gz").sample(n=200, random_state=5)
+    X = df[list(PIPEWEAVE_FEATURES["gemm"])].to_numpy(float)
+    f = np.full(len(df), 0.208)          # an L4
+    Xp = f[:, None]
+
+    cfg = TransferConfig(power_features=("idle_fraction",), power_into="pi",
+                         pi_floor_from_idle=True, warmup_epochs=10, max_epochs=10, seed=0)
+    m = TransferModel.from_checkpoint(path, "gemm", cfg)
+    assert (m.predict(X, Xp=Xp, idle_fraction=f)[:, 1] >= f).all()
+
+    ok = np.column_stack([df["overall_perf"].to_numpy(float), np.full(len(df), 0.5)])
+    m.fit(X, ok, Xp=Xp, idle_fraction=f)   # respects the bound: fine
+
+    bad = np.column_stack([df["overall_perf"].to_numpy(float), np.full(len(df), 0.05)])
+    with pytest.raises(ValueError, match="below their card's idle fraction"):
+        TransferModel.from_checkpoint(path, "gemm", cfg).fit(
+            X, bad, Xp=Xp, idle_fraction=f)
+
+
+def test_power_matrix_is_built_from_the_fleet_table():
+    from kernelenergy.pipeweave.hardware import POWER_FEATURES, power_matrix
+
+    M = power_matrix(["L4", "L40S", "A100_PCIE"], POWER_FEATURES)
+    assert M.shape == (3, 3)
+    # idle_fraction: the L4 gives up a far larger share of its budget to idle.
+    assert M[0, 0] > M[1, 0] and M[0, 0] == pytest.approx(15.0 / 72.0, rel=1e-6)
+    assert np.isfinite(M).all()

@@ -83,7 +83,10 @@ def mahalanobis(operator: str, X: np.ndarray) -> np.ndarray:
     is applied here, because the distance must be measured in the space the model
     actually reads.
     """
-    m = load_moments()[operator]
+    # GroupNorm shares RMSNorm's feature vector, so its distance is measured against
+    # the RMSNorm distribution -- which is the point: that distance is how we know it
+    # does not belong there.
+    m = load_moments()["rmsnorm" if operator == "groupnorm" else operator]
     names = list(PIPEWEAVE_FEATURES[operator])
     if list(m["features"]) != names:
         raise ValueError(
@@ -115,7 +118,7 @@ def ood_report(df, models_root=None, quantile: str = "md_p99"):
         if not len(sub):
             continue
         d = mahalanobis(op, sub[cols].to_numpy(float))
-        ref = load_moments()[op]
+        ref = load_moments()["rmsnorm" if op == "groupnorm" else op]
         rows.append({
             "operator": op, "gpu_key": gpu, "n": len(sub),
             "md_median": float(np.median(d)),

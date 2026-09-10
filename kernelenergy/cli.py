@@ -322,6 +322,7 @@ def cmd_transfer(args) -> int:
         compare_floors, evaluate_transfer, prepare, range_report,
     )
     from kernelenergy.pipeweave.features import emit_frame
+    from kernelenergy.pipeweave.hardware import POWER_FEATURES
     from kernelenergy.pipeweave.transfer import TransferConfig
 
     ds = pd.read_csv(args.dataset)
@@ -371,7 +372,14 @@ def cmd_transfer(args) -> int:
         trunk_lr_scale=args.trunk_lr_scale, freeze_bn=not args.train_bn,
         energy_weight=args.energy_weight, loss=args.loss,
         grad_clip=args.grad_clip, verbose=args.verbose,
+        power_features=(POWER_FEATURES if args.power_features else ()),
+        power_into=args.power_into,
+        pi_floor_from_idle=args.pi_floor,
     )
+    if args.power_features:
+        print(f"power features -> {args.power_into}: {', '.join(POWER_FEATURES)}")
+        print("  new weight columns start at zero, so epoch 0 is identical to the "
+              "plain transfer")
     tab, results = evaluate_transfer(ds, args.models, cfg, operators=args.operators or None)
 
     print("\n=== energy APE (%) by held-out GPU and operator ===")
@@ -720,6 +728,20 @@ def main(argv=None) -> int:
                    help="epochs training the power head alone before the trunk is "
                         "unfrozen")
     c.add_argument("--trunk-lr-scale", type=float, default=0.1)
+    c.add_argument("--power-features", action="store_true",
+                   help="give the model per-card power descriptors PipeWeave's features "
+                        "lack (idle fraction, W/TFLOP, W per GB/s). New weight columns "
+                        "are zero-initialised, so this cannot change the model at "
+                        "epoch 0 -- it can only be learned into")
+    c.add_argument("--power-into", default="pi", choices=["pi", "trunk", "both"],
+                   help="pi = side channel into the power head only, leaving the "
+                        "efficiency path provably untouched (default and recommended); "
+                        "trunk = widen the first Linear, more expressive but it can "
+                        "perturb eta")
+    c.add_argument("--pi-floor", action="store_true",
+                   help="reparameterise pi = idle_frac + (1-idle_frac)*sigmoid(z), so "
+                        "the prediction cannot fall below the card's idle draw. Refuses "
+                        "if the training data violates that bound")
     c.add_argument("--warmup-only", action="store_true",
                    help="fit ONLY the new power head; leave their trunk and efficiency "
                         "head exactly as released. The strongest configuration when "

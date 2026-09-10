@@ -44,8 +44,8 @@ import numpy as np
 import pandas as pd
 
 from kernelenergy.model.estimator import mape
-from kernelenergy.pipeweave.features import PIPEWEAVE_FEATURES
-from kernelenergy.pipeweave.hardware import PW_HARDWARE
+from kernelenergy.pipeweave.features import NO_CHECKPOINT, PIPEWEAVE_FEATURES
+from kernelenergy.pipeweave.hardware import PW_HARDWARE, power_matrix
 from kernelenergy.pipeweave.transfer import (
     TransferConfig,
     TransferModel,
@@ -170,6 +170,7 @@ def evaluate_transfer(
     results: list[OperatorResult] = []
     skipped: list[str] = []
     missing_checkpoints: list[str] = []
+    no_counterpart: list[str] = []
 
     for op, sub in df.groupby("pw_operator"):
         if operators and op not in operators:
@@ -177,6 +178,15 @@ def evaluate_transfer(
         names = list(PIPEWEAVE_FEATURES[op])
         cols = [f"pw_{n}" for n in names]
         sub = sub.dropna(subset=cols)
+        if op in NO_CHECKPOINT:
+            # By design, not by accident. Reported so the rows are visibly accounted
+            # for rather than silently absent from the table.
+            no_counterpart.append(
+                f"{op}: {len(sub)} rows — PipeWeave has no checkpoint for this "
+                f"operator, so nothing is transferred to it. The from-scratch model in "
+                f"`kernelenergy evaluate` covers these."
+            )
+            continue
         try:
             ckpt, _ = find_checkpoint(models_root, op)
         except FileNotFoundError as e:
@@ -192,6 +202,16 @@ def evaluate_transfer(
                 continue
 
             Xtr, Xte = tr[cols].to_numpy(float), te[cols].to_numpy(float)
+            # Power descriptors their features do not carry. None unless configured,
+            # in which case the new weight columns start at zero and the model is
+            # identical to the plain transfer until training moves them.
+            pf = cfg.power_features
+            Ptr = power_matrix(tr["gpu_key"], pf) if pf else None
+            Pte = power_matrix(te["gpu_key"], pf) if pf else None
+            Ftr = Ptr[:, list(pf).index("idle_fraction")] if (
+                pf and cfg.pi_floor_from_idle and "idle_fraction" in pf) else None
+            Fte = Pte[:, list(pf).index("idle_fraction")] if (
+                pf and cfg.pi_floor_from_idle and "idle_fraction" in pf) else None
             Ytr = tr[["eta_pw", "pi"]].to_numpy(float)
             eta_true = te["eta_pw"].to_numpy(float)
             pi_true = te["pi"].to_numpy(float)
@@ -206,7 +226,7 @@ def evaluate_transfer(
 
             # --- zero-shot: their weights, untouched; pi = training median -------
             zs = TransferModel.from_checkpoint(ckpt, op, cfg)
-            eta_zs = zs.predict(Xte)[:, 0]
+            eta_zs = zs.predict(Xte, Xp=Pte, idle_fraction=Fte)[:, 0]
             pi_zs = np.full(len(te), float(np.median(Ytr[:, 1])))
             e_zs = _energy(eta_zs, pi_zs, theory, tdp, eta_floor)
 
@@ -217,21 +237,21 @@ def evaluate_transfer(
                    theory=tr["theory_pw_s"].to_numpy(float),
                    tdp=tr["tdp_w"].to_numpy(float),
                    energy=tr["energy_j"].to_numpy(float),
-                   monitor=(Xte, Yte_m))
+                   monitor=(Xte, Yte_m, Pte, Fte), Xp=Ptr, idle_fraction=Ftr)
             ft.history.label = f"{gpu}/{op}/finetuned"
-            p_ft = ft.predict(Xte)
+            p_ft = ft.predict(Xte, Xp=Pte, idle_fraction=Fte)
             e_ft = _energy(p_ft[:, 0], p_ft[:, 1], theory, tdp, eta_floor)
 
             # --- from scratch: same architecture, random init ---------------------
-            sc = TransferModel(len(names), cfg)
+            sc = TransferModel(len(names), cfg, n_power=len(pf))
             sc._loaded = True  # deliberate: this is the control, not a transfer
             sc.fit(Xtr, Ytr,
                    theory=tr["theory_pw_s"].to_numpy(float),
                    tdp=tr["tdp_w"].to_numpy(float),
                    energy=tr["energy_j"].to_numpy(float),
-                   monitor=(Xte, Yte_m))
+                   monitor=(Xte, Yte_m, Pte, Fte), Xp=Ptr, idle_fraction=Ftr)
             sc.history.label = f"{gpu}/{op}/scratch"
-            p_sc = sc.predict(Xte)
+            p_sc = sc.predict(Xte, Xp=Pte, idle_fraction=Fte)
             e_sc = _energy(p_sc[:, 0], p_sc[:, 1], theory, tdp, eta_floor)
 
             # --- hybrid: transfer where it is speaking, scratch where it is not ----
@@ -241,7 +261,7 @@ def evaluate_transfer(
             # Composing C/eta from that is not a wrong prediction, it is not a
             # prediction. Where it happens, use the model that was fitted on data
             # resembling the row.
-            sat = ft.saturated(Xte)
+            sat = ft.saturated(Xte, Xp=Pte)
             e_hy = np.where(sat, e_sc, e_ft)
 
             preds = te[[c for c in ("gpu_key", "category", "source_model", "kernel_sig")
@@ -274,6 +294,10 @@ def evaluate_transfer(
                 histories={"finetuned": ft.history, "scratch": sc.history},
             ))
 
+    if no_counterpart:
+        print("evaluate_transfer: operators with no PipeWeave counterpart")
+        for s_ in no_counterpart:
+            print(f"  {s_}")
     if missing_checkpoints:
         print(f"evaluate_transfer: no checkpoint for {len(missing_checkpoints)} operator(s)")
         for s in missing_checkpoints:

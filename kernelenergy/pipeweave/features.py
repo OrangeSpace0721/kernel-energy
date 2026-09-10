@@ -110,6 +110,9 @@ PIPEWEAVE_FEATURES: dict[str, tuple[str, ...]] = {
     "attn": _TENSOR + _XU + _MEMORY,     # 15
     "rmsnorm": _FMA + _XU + _MEMORY,     # 15
     "siluandmul": _FMA + _XU + _MEMORY,  # 15
+    # Same vector as rmsnorm -- it is the same op model -- but no checkpoint exists,
+    # so it is never transferred to. See NO_CHECKPOINT.
+    "groupnorm": _FMA + _XU + _MEMORY,   # 15
 }
 
 CATEGORY_TO_OPERATOR = {
@@ -119,6 +122,12 @@ CATEGORY_TO_OPERATOR = {
     "norm": "rmsnorm",
     "elementwise": "siluandmul",
 }
+
+#: Operators this project emits features for that PipeWeave has **no checkpoint** for.
+#: They still get a feature vector -- it is computable and useful to the from-scratch
+#: model -- but nothing is transferred to them, and ``evaluate_transfer`` says so rather
+#: than routing them through a checkpoint that has never seen their shape.
+NO_CHECKPOINT = ("groupnorm",)
 
 
 @dataclass
@@ -236,6 +245,19 @@ def emit(
 
     if cat == "norm":
         kind = str(p.get("kind", "layer"))
+        # GroupNorm is a different operator wearing the same category label, and giving
+        # it to their RMSNorm checkpoint is the single largest distribution error in the
+        # transfer. Their corpus is LLM RMSNorm: ``dim`` is a transformer hidden size,
+        # 128 to 16,384. A VAE GroupNorm's row is a whole group of feature maps -- at
+        # 1024x1024 that is 4,194,304 elements, 256x their maximum. Measured joint
+        # distance from their training distribution is 22-41 against a training p99 of
+        # 10.2, and it is card-independent (22.0 on A100, 23.1 on L4), which is why it
+        # struck all five cards at once and why blaming L4 was wrong.
+        #
+        # It is labelled its own operator so nothing transfers to it. The features are
+        # still emitted: the from-scratch model uses them, and they are what the
+        # distance above was computed from.
+        operator = "groupnorm" if kind == "group" else "rmsnorm"
         problem = RmsNormProblemConfig(
             batch_size=int(p["rows"]), dim=int(p["dim"]), dtype_size=dsize
         )
@@ -245,13 +267,19 @@ def emit(
                 f"{kind}norm through an RMSNorm op model: same traffic and task shape, "
                 f"one extra reduction pass for the mean that the op counts omit"
             )
+        if kind == "group":
+            notes.append(
+                "GroupNorm has no PipeWeave counterpart: their RMSNorm corpus tops out "
+                "at dim 16,384 and a VAE group row is 16-256x that. Emitted for the "
+                "from-scratch model; nothing is transferred to it"
+            )
         v = np.array(
             _pipe_values(f.fma_pipe, _FMA)
             + _pipe_values(f.xu_pipe, _XU)
             + _memory_values(f.memory_pipe),
             dtype=float,
         )
-        return Emission("rmsnorm", v, PIPEWEAVE_FEATURES["rmsnorm"], None, tuple(notes))
+        return Emission(operator, v, PIPEWEAVE_FEATURES["rmsnorm"], None, tuple(notes))
 
     if cat == "elementwise":
         n_elem = int(p["n_elem"])
