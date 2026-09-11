@@ -395,8 +395,8 @@ def cmd_transfer(args) -> int:
             print("    both arms share each seed, so the validation split, the shuffling")
             print("    and every shared initialisation are held fixed; the difference is")
             print("    the mechanism.")
-            a = run_seeds(ds, args.models, off, n, args.seed, "no-power")
-            b = run_seeds(ds, args.models, on, n, args.seed, "power")
+            a = run_seeds(ds, args.models, off, n, args.seed, "no-power", jobs=args.jobs)
+            b = run_seeds(ds, args.models, on, n, args.seed, "power", jobs=args.jobs)
             for metric in ("hybrid", "ft_med", "pi_ft"):
                 cells, verdict = paired_compare(a, b, metric, "no-power", "power")
                 print(f"\n--- {metric} ---")
@@ -409,7 +409,7 @@ def cmd_transfer(args) -> int:
             return 0
 
         print(f"\n=== {n} seeds ===")
-        runs = run_seeds(ds, args.models, cfg, n, args.seed)
+        runs = run_seeds(ds, args.models, cfg, n, args.seed, jobs=args.jobs)
         summ = seed_summary(runs)
         print("\n    value is the median across seeds; _pm is half the min-max range.")
         print("    A cell whose _pm rivals its value is telling you about the seed, "
@@ -420,7 +420,8 @@ def cmd_transfer(args) -> int:
             print(f"\nwrote every run to {args.out}")
         return 0
 
-    tab, results = evaluate_transfer(ds, args.models, cfg, operators=args.operators or None)
+    tab, results = evaluate_transfer(ds, args.models, cfg,
+                                 operators=args.operators or None, jobs=args.jobs)
 
     print("\n=== energy APE (%) by held-out GPU and operator ===")
     print("    zeroshot = their weights untouched, pi = training median")
@@ -820,6 +821,11 @@ def main(argv=None) -> int:
                    help="write the dataset with pw_* feature columns here")
     c.add_argument("--predictions", default="")
     c.add_argument("--out", default="")
+    c.add_argument("--jobs", type=int, default=1,
+                   help="processes to spread the folds over; -1 uses every core. The "
+                        "folds are independent and separately seeded, so this changes "
+                        "the wall clock and not the numbers. A 5-seed A/B is 200 fits, "
+                        "about 13 min on one core.")
     c.add_argument("--verbose", action="store_true")
     c.set_defaults(func=cmd_transfer)
 

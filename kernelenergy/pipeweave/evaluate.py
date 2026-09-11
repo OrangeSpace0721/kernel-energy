@@ -46,6 +46,7 @@ import pandas as pd
 from kernelenergy.model.estimator import mape
 from kernelenergy.pipeweave.features import NO_CHECKPOINT, PIPEWEAVE_FEATURES
 from kernelenergy.pipeweave.hardware import PW_HARDWARE, power_matrix
+from kernelenergy.pipeweave.parallel import pmap
 from kernelenergy.pipeweave.transfer import (
     TransferConfig,
     TransferModel,
@@ -133,17 +134,129 @@ def _ape(y_true, y_pred):
     return float(np.mean(ape)), float(np.median(ape))
 
 
+def _fit_fold(task: tuple) -> OperatorResult:
+    """One held-out card, one operator: zero-shot, fine-tune, scratch, hybrid.
+
+    Module-level and taking a single picklable tuple so that
+    :func:`kernelenergy.pipeweave.parallel.pmap` can ship it to another process. Every
+    input it needs is in ``task``; it reads no global state and writes none, which is
+    what makes the folds safe to run in any order or all at once.
+    """
+    op, names, cols, ckpt, cfg, gpu, tr, te = task
+
+    Xtr, Xte = tr[cols].to_numpy(float), te[cols].to_numpy(float)
+    # Power descriptors their features do not carry. None unless configured,
+    # in which case the new weight columns start at zero and the model is
+    # identical to the plain transfer until training moves them.
+    pf = cfg.power_features
+    Ptr = power_matrix(tr["gpu_key"], pf) if pf else None
+    Pte = power_matrix(te["gpu_key"], pf) if pf else None
+    Ftr = Ptr[:, list(pf).index("idle_fraction")] if (
+        pf and cfg.pi_floor_from_idle and "idle_fraction" in pf) else None
+    Fte = Pte[:, list(pf).index("idle_fraction")] if (
+        pf and cfg.pi_floor_from_idle and "idle_fraction" in pf) else None
+    Ytr = tr[["eta_pw", "pi"]].to_numpy(float)
+    eta_true = te["eta_pw"].to_numpy(float)
+    pi_true = te["pi"].to_numpy(float)
+    theory = te["theory_pw_s"].to_numpy(float)
+    tdp = te["tdp_w"].to_numpy(float)
+    e_true = te["energy_j"].to_numpy(float)
+
+    # The model may not claim an efficiency below anything the training split
+    # contained. Half the training minimum leaves room to extrapolate a little
+    # without letting the division run away.
+    eta_floor = max(float(Ytr[:, 0].min()) * 0.5, 1e-8)
+
+    # --- zero-shot: their weights, untouched; pi = training median -------
+    zs = TransferModel.from_checkpoint(ckpt, op, cfg)
+    eta_zs = zs.predict(Xte, Xp=Pte, idle_fraction=Fte)[:, 0]
+    pi_zs = np.full(len(te), float(np.median(Ytr[:, 1])))
+    e_zs = _energy(eta_zs, pi_zs, theory, tdp, eta_floor)
+
+    # --- fine-tuned ------------------------------------------------------
+    Yte_m = te[["eta_pw", "pi"]].to_numpy(float)
+    ft = TransferModel.from_checkpoint(ckpt, op, cfg)
+    ft.fit(Xtr, Ytr,
+           theory=tr["theory_pw_s"].to_numpy(float),
+           tdp=tr["tdp_w"].to_numpy(float),
+           energy=tr["energy_j"].to_numpy(float),
+           monitor=(Xte, Yte_m, Pte, Fte), Xp=Ptr, idle_fraction=Ftr)
+    ft.history.label = f"{gpu}/{op}/finetuned"
+    p_ft = ft.predict(Xte, Xp=Pte, idle_fraction=Fte)
+    e_ft = _energy(p_ft[:, 0], p_ft[:, 1], theory, tdp, eta_floor)
+
+    # --- from scratch: same architecture, random init ---------------------
+    sc = TransferModel(len(names), cfg, n_power=len(pf))
+    sc._loaded = True  # deliberate: this is the control, not a transfer
+    sc.fit(Xtr, Ytr,
+           theory=tr["theory_pw_s"].to_numpy(float),
+           tdp=tr["tdp_w"].to_numpy(float),
+           energy=tr["energy_j"].to_numpy(float),
+           monitor=(Xte, Yte_m, Pte, Fte), Xp=Ptr, idle_fraction=Ftr)
+    sc.history.label = f"{gpu}/{op}/scratch"
+    p_sc = sc.predict(Xte, Xp=Pte, idle_fraction=Fte)
+    e_sc = _energy(p_sc[:, 0], p_sc[:, 1], theory, tdp, eta_floor)
+
+    # --- hybrid: transfer where it is speaking, scratch where it is not ----
+    # A saturated efficiency head has stopped carrying information -- the L4
+    # norm case returns a logit of -71.6, i.e. an efficiency of 1e-31, on a
+    # kernel whose features are every one of them inside their training range.
+    # Composing C/eta from that is not a wrong prediction, it is not a
+    # prediction. Where it happens, use the model that was fitted on data
+    # resembling the row.
+    sat = ft.saturated(Xte, Xp=Pte)
+    e_hy = np.where(sat, e_sc, e_ft)
+
+    preds = te[[c for c in ("gpu_key", "category", "source_model", "kernel_sig")
+                if c in te.columns]].copy()
+    preds["operator"] = op
+    preds["energy_true"] = e_true
+    preds["energy_zeroshot"] = e_zs
+    preds["energy_finetuned"] = e_ft
+    preds["energy_scratch"] = e_sc
+    preds["energy_hybrid"] = e_hy
+    preds["saturated"] = sat
+    preds["eta_true"], preds["eta_zeroshot"] = eta_true, eta_zs
+    preds["eta_finetuned"] = p_ft[:, 0]
+    preds["pi_true"], preds["pi_finetuned"] = pi_true, p_ft[:, 1]
+
+    ft_mean, ft_med = _ape(e_true, e_ft)
+    return OperatorResult(
+        gpu=str(gpu), operator=op, n_train=len(tr), n_test=len(te),
+        energy_zeroshot=_ape(e_true, e_zs)[0],
+        energy_finetuned=ft_mean,
+        energy_scratch=_ape(e_true, e_sc)[0],
+        energy_finetuned_median=ft_med,
+        energy_hybrid=_ape(e_true, e_hy)[0],
+        frac_saturated=float(sat.mean()),
+        eta_zeroshot=_ape(eta_true, eta_zs)[1],
+        eta_finetuned=_ape(eta_true, p_ft[:, 0])[1],
+        pi_finetuned=_ape(pi_true, p_ft[:, 1])[1],
+        frac_eta_below_train=float((eta_true < Ytr[:, 0].min()).mean()),
+        predictions=preds,
+        histories={"finetuned": ft.history, "scratch": sc.history},
+    )
+
+
 def evaluate_transfer(
     df: pd.DataFrame,
     models_root: str | Path,
     config: TransferConfig | None = None,
     min_rows: int = 40,
     operators: tuple[str, ...] | None = None,
+    jobs: int = 1,
+    verbose: bool = True,
 ) -> tuple[pd.DataFrame, list[OperatorResult]]:
     """Leave-one-GPU-out, one model per (fold, operator).
 
     ``df`` must have been through :func:`prepare`. Returns a per-(GPU, operator) table
     plus the raw results.
+
+    ``jobs`` spreads the folds over processes: ``1`` stays here, ``-1`` uses every core.
+    The folds are independent and separately seeded, so this changes the wall clock and
+    nothing else -- the table from ``jobs=8`` is identical to the table from ``jobs=1``,
+    and :mod:`kernelenergy.pipeweave.parallel` explains why that has to be checked
+    rather than assumed.
     """
     models_root = Path(models_root)
     cfg = config or TransferConfig()
@@ -167,6 +280,7 @@ def evaluate_transfer(
         raise KeyError(f"missing {sorted(missing)}")
 
     df = df.dropna(subset=["eta_pw", "pi", "theory_pw_s", "energy_j"]).copy()
+    tasks: list[tuple] = []
     results: list[OperatorResult] = []
     skipped: list[str] = []
     missing_checkpoints: list[str] = []
@@ -200,99 +314,14 @@ def evaluate_transfer(
                     f"{op}/{gpu}: {len(tr)} train, {len(te)} test -- below threshold"
                 )
                 continue
+            tasks.append((op, names, cols, ckpt, cfg, str(gpu), tr, te))
 
-            Xtr, Xte = tr[cols].to_numpy(float), te[cols].to_numpy(float)
-            # Power descriptors their features do not carry. None unless configured,
-            # in which case the new weight columns start at zero and the model is
-            # identical to the plain transfer until training moves them.
-            pf = cfg.power_features
-            Ptr = power_matrix(tr["gpu_key"], pf) if pf else None
-            Pte = power_matrix(te["gpu_key"], pf) if pf else None
-            Ftr = Ptr[:, list(pf).index("idle_fraction")] if (
-                pf and cfg.pi_floor_from_idle and "idle_fraction" in pf) else None
-            Fte = Pte[:, list(pf).index("idle_fraction")] if (
-                pf and cfg.pi_floor_from_idle and "idle_fraction" in pf) else None
-            Ytr = tr[["eta_pw", "pi"]].to_numpy(float)
-            eta_true = te["eta_pw"].to_numpy(float)
-            pi_true = te["pi"].to_numpy(float)
-            theory = te["theory_pw_s"].to_numpy(float)
-            tdp = te["tdp_w"].to_numpy(float)
-            e_true = te["energy_j"].to_numpy(float)
+    if tasks:
+        # Heaviest first. A fold's cost is very nearly linear in its training rows at
+        # fixed epochs, so row count is a good enough estimate to keep the tail short.
+        results = pmap(_fit_fold, tasks, jobs=jobs,
+                       weight=lambda t: len(t[6]), label="fold", verbose=verbose)
 
-            # The model may not claim an efficiency below anything the training split
-            # contained. Half the training minimum leaves room to extrapolate a little
-            # without letting the division run away.
-            eta_floor = max(float(Ytr[:, 0].min()) * 0.5, 1e-8)
-
-            # --- zero-shot: their weights, untouched; pi = training median -------
-            zs = TransferModel.from_checkpoint(ckpt, op, cfg)
-            eta_zs = zs.predict(Xte, Xp=Pte, idle_fraction=Fte)[:, 0]
-            pi_zs = np.full(len(te), float(np.median(Ytr[:, 1])))
-            e_zs = _energy(eta_zs, pi_zs, theory, tdp, eta_floor)
-
-            # --- fine-tuned ------------------------------------------------------
-            Yte_m = te[["eta_pw", "pi"]].to_numpy(float)
-            ft = TransferModel.from_checkpoint(ckpt, op, cfg)
-            ft.fit(Xtr, Ytr,
-                   theory=tr["theory_pw_s"].to_numpy(float),
-                   tdp=tr["tdp_w"].to_numpy(float),
-                   energy=tr["energy_j"].to_numpy(float),
-                   monitor=(Xte, Yte_m, Pte, Fte), Xp=Ptr, idle_fraction=Ftr)
-            ft.history.label = f"{gpu}/{op}/finetuned"
-            p_ft = ft.predict(Xte, Xp=Pte, idle_fraction=Fte)
-            e_ft = _energy(p_ft[:, 0], p_ft[:, 1], theory, tdp, eta_floor)
-
-            # --- from scratch: same architecture, random init ---------------------
-            sc = TransferModel(len(names), cfg, n_power=len(pf))
-            sc._loaded = True  # deliberate: this is the control, not a transfer
-            sc.fit(Xtr, Ytr,
-                   theory=tr["theory_pw_s"].to_numpy(float),
-                   tdp=tr["tdp_w"].to_numpy(float),
-                   energy=tr["energy_j"].to_numpy(float),
-                   monitor=(Xte, Yte_m, Pte, Fte), Xp=Ptr, idle_fraction=Ftr)
-            sc.history.label = f"{gpu}/{op}/scratch"
-            p_sc = sc.predict(Xte, Xp=Pte, idle_fraction=Fte)
-            e_sc = _energy(p_sc[:, 0], p_sc[:, 1], theory, tdp, eta_floor)
-
-            # --- hybrid: transfer where it is speaking, scratch where it is not ----
-            # A saturated efficiency head has stopped carrying information -- the L4
-            # norm case returns a logit of -71.6, i.e. an efficiency of 1e-31, on a
-            # kernel whose features are every one of them inside their training range.
-            # Composing C/eta from that is not a wrong prediction, it is not a
-            # prediction. Where it happens, use the model that was fitted on data
-            # resembling the row.
-            sat = ft.saturated(Xte, Xp=Pte)
-            e_hy = np.where(sat, e_sc, e_ft)
-
-            preds = te[[c for c in ("gpu_key", "category", "source_model", "kernel_sig")
-                        if c in te.columns]].copy()
-            preds["operator"] = op
-            preds["energy_true"] = e_true
-            preds["energy_zeroshot"] = e_zs
-            preds["energy_finetuned"] = e_ft
-            preds["energy_scratch"] = e_sc
-            preds["energy_hybrid"] = e_hy
-            preds["saturated"] = sat
-            preds["eta_true"], preds["eta_zeroshot"] = eta_true, eta_zs
-            preds["eta_finetuned"] = p_ft[:, 0]
-            preds["pi_true"], preds["pi_finetuned"] = pi_true, p_ft[:, 1]
-
-            ft_mean, ft_med = _ape(e_true, e_ft)
-            results.append(OperatorResult(
-                gpu=str(gpu), operator=op, n_train=len(tr), n_test=len(te),
-                energy_zeroshot=_ape(e_true, e_zs)[0],
-                energy_finetuned=ft_mean,
-                energy_scratch=_ape(e_true, e_sc)[0],
-                energy_finetuned_median=ft_med,
-                energy_hybrid=_ape(e_true, e_hy)[0],
-                frac_saturated=float(sat.mean()),
-                eta_zeroshot=_ape(eta_true, eta_zs)[1],
-                eta_finetuned=_ape(eta_true, p_ft[:, 0])[1],
-                pi_finetuned=_ape(pi_true, p_ft[:, 1])[1],
-                frac_eta_below_train=float((eta_true < Ytr[:, 0].min()).mean()),
-                predictions=preds,
-                histories={"finetuned": ft.history, "scratch": sc.history},
-            ))
 
     if no_counterpart:
         print("evaluate_transfer: operators with no PipeWeave counterpart")

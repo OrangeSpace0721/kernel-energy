@@ -57,8 +57,15 @@ def sign_test_p(wins: int, n: int) -> float:
 
 def run_seeds(df, models_root, config: TransferConfig | None = None,
               seeds: int = 5, base_seed: int = 0, label: str = "",
-              verbose: bool = True) -> pd.DataFrame:
-    """``evaluate_transfer`` over ``seeds`` seeds. Returns every cell of every run."""
+              verbose: bool = True, jobs: int = 1) -> pd.DataFrame:
+    """``evaluate_transfer`` over ``seeds`` seeds. Returns every cell of every run.
+
+    ``jobs`` is passed straight down to the fold map inside each run rather than used
+    to run whole seeds side by side. Both would parallelise the same total work, but
+    the fold map has four times the tasks to play with and they finish at uneven times,
+    so it packs cores better; running seeds in parallel would also multiply peak memory
+    by the seed count for no gain.
+    """
     cfg = config or TransferConfig()
     frames = []
     for i in range(seeds):
@@ -66,7 +73,8 @@ def run_seeds(df, models_root, config: TransferConfig | None = None,
         if verbose:
             tag = f"{label} " if label else ""
             print(f"  {tag}seed {s} ({i + 1}/{seeds})...", flush=True)
-        tab, _ = evaluate_transfer(df, models_root, dataclasses.replace(cfg, seed=s))
+        tab, _ = evaluate_transfer(df, models_root, dataclasses.replace(cfg, seed=s),
+                                   jobs=jobs, verbose=verbose)
         t = tab.reset_index()
         t["seed"] = s
         t["arm"] = label or "run"
